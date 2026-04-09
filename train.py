@@ -35,6 +35,16 @@ Hyperparameters:
     --warmup_steps    LR warmup steps (default: 10)
     --max_seq_len     Max sequence length (default: 640)
     --kl_start_pos    Compute KL from this position onward (default: 128)
+
+Stability:
+    On a single GPU, teacher+student ``device_map='auto'`` is fragile; if logged KL jumps
+    to tens, lower ``--lr`` (try 2e-5) and use ``--save_every 1``. The run also writes
+    ``output_dir/best_train_kl/`` whenever the per-step train KL improves, so you do not
+    lose a good checkpoint when a later step destroys weights (``final/`` is always last).
+
+Output:
+    By default the entire ``--output_dir`` is deleted before a new run. Use ``--resume-from``
+    or ``--no-clean-output`` to preserve it.
 """
 
 import os
@@ -45,6 +55,7 @@ import copy
 import gc
 import json
 import logging
+import math
 import random
 import shutil
 import time
@@ -136,6 +147,26 @@ def finalize_checkpoint_for_submission(checkpoint_dir: str) -> None:
             e,
             _PREPROCESSOR_TEMPLATE_REPO,
         )
+
+
+def save_student_checkpoint(
+    student, tokenizer, optimizer, args, global_step, dest_name: str, total_sampled: int,
+) -> str:
+    """Write student weights, tokenizer, submission config, optimizer, and train_state.json."""
+    d = os.path.join(args.output_dir, dest_name)
+    os.makedirs(d, exist_ok=True)
+    student.save_pretrained(d, safe_serialization=True)
+    tokenizer.save_pretrained(d)
+    finalize_checkpoint_for_submission(d)
+    torch.save(optimizer.state_dict(), os.path.join(d, "optimizer.pt"))
+    with open(os.path.join(d, "train_state.json"), "w") as f:
+        json.dump({
+            "global_step": global_step,
+            "total_sampled": total_sampled,
+            "seed": args.seed,
+        }, f, indent=2)
+    log.info(f"  Saved checkpoint: {d}")
+    return d
 
 
 class RandomPromptSampler:
@@ -298,11 +329,14 @@ def main():
 
     # Output
     parser.add_argument("--output_dir", type=str, default="./distil-checkpoints",
-                        help="Directory to save checkpoints")
+                        help="Directory to save checkpoints (removed and recreated each run unless "
+                             "--resume-from or --no-clean-output)")
     parser.add_argument("--save_every", type=int, default=SAVE_EVERY,
-                        help="Save checkpoint every N steps")
+                        help="Save step_N/ every N steps (use 1 when max_steps is small)")
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Resume from a checkpoint directory (loads optimizer + step count)")
+    parser.add_argument("--no-clean-output", action="store_true", dest="no_clean_output",
+                        help="Keep existing output_dir contents (default: delete output_dir when not resuming)")
 
     # Logging
     parser.add_argument("--wandb_project", type=str, default="distil-training")
@@ -329,6 +363,23 @@ def main():
                 args.student_gpu,
             )
             args.single_gpu = True
+
+    if args.max_steps > 0 and args.save_every > args.max_steps:
+        log.warning(
+            "save_every=%d > max_steps=%d: no step_* folders will be written; "
+            "only final/ (last weights). Use --save_every 1 to snapshot each step, "
+            "or rely on best_train_kl/ (best train KL so far).",
+            args.save_every,
+            args.max_steps,
+        )
+
+    out_abs = os.path.abspath(os.path.expanduser(args.output_dir))
+    if args.resume_from is None and not args.no_clean_output:
+        if os.path.isdir(out_abs):
+            log.info("Clearing output directory: %s", out_abs)
+            shutil.rmtree(out_abs)
+    elif args.resume_from and not args.no_clean_output:
+        log.info("Keeping output directory (training with --resume-from).")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -422,6 +473,7 @@ def main():
     # ── Prompt sampler ────────────────────────────────────────────────────
     sampler = RandomPromptSampler(seed=args.seed)
     cached_texts = None
+    best_train_kl = float("inf")
 
     # ── Training loop ─────────────────────────────────────────────────────
     log.info("=" * 60)
@@ -476,13 +528,18 @@ def main():
             n += 1
             del t_logits, s_logits, loss
 
+        avg_kl = total_loss / max(n, 1)
+        if not math.isfinite(avg_kl):
+            log.error("Non-finite training KL; skipping optimizer update and stopping.")
+            optimizer.zero_grad(set_to_none=True)
+            break
+
         torch.nn.utils.clip_grad_norm_(student.parameters(), GRAD_CLIP)
         optimizer.step()
         scheduler.step()
         global_step += 1
 
         elapsed = time.time() - t0
-        avg_kl = total_loss / max(n, 1)
         lr = scheduler.get_last_lr()[0]
         log.info(f"Step {global_step} | KL: {avg_kl:.4f} | LR: {lr:.2e} | "
                  f"{elapsed:.1f}s ({n/elapsed:.1f} samp/s) | total_sampled: {sampler.total_sampled:,}")
@@ -493,34 +550,38 @@ def main():
                        "perf/step_time": elapsed, "perf/samples_per_sec": n / elapsed,
                        "data/total_sampled": sampler.total_sampled}, step=global_step)
 
-        # Save checkpoint
+        if avg_kl < best_train_kl:
+            best_train_kl = avg_kl
+            save_student_checkpoint(
+                student, tokenizer, optimizer, args, global_step,
+                "best_train_kl", sampler.total_sampled,
+            )
+
         if global_step % args.save_every == 0:
-            d = os.path.join(args.output_dir, f"step_{global_step}")
-            os.makedirs(d, exist_ok=True)
-            student.save_pretrained(d, safe_serialization=True)
-            tokenizer.save_pretrained(d)
-            finalize_checkpoint_for_submission(d)
-            torch.save(optimizer.state_dict(), os.path.join(d, "optimizer.pt"))
-            with open(os.path.join(d, "train_state.json"), "w") as f:
-                json.dump({
-                    "global_step": global_step,
-                    "total_sampled": sampler.total_sampled,
-                    "seed": args.seed,
-                }, f, indent=2)
-            log.info(f"  Saved checkpoint: {d}")
+            save_student_checkpoint(
+                student, tokenizer, optimizer, args, global_step,
+                f"step_{global_step}", sampler.total_sampled,
+            )
 
         # Periodic cleanup
         if global_step % 10 == 0:
             gc.collect()
             torch.cuda.empty_cache()
 
-    # Final save
-    final_dir = os.path.join(args.output_dir, "final")
-    os.makedirs(final_dir, exist_ok=True)
-    student.save_pretrained(final_dir, safe_serialization=True)
-    tokenizer.save_pretrained(final_dir)
-    finalize_checkpoint_for_submission(final_dir)
-    log.info(f"Training complete at step {global_step}. Final model saved to {final_dir}")
+    # Final save (last weights after last optimizer step — may be worse than best_train_kl/)
+    save_student_checkpoint(
+        student, tokenizer, optimizer, args, global_step,
+        "final", sampler.total_sampled,
+    )
+    if best_train_kl < float("inf"):
+        log.info(
+            "Training complete at step %d. For eval, prefer best_train_kl/ if train KL spiked "
+            "(best train KL was %.4f; see final/ for last step only).",
+            global_step,
+            best_train_kl,
+        )
+    else:
+        log.info("Training complete at step %d.", global_step)
 
     if not args.no_wandb:
         import wandb
