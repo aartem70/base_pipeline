@@ -15,6 +15,9 @@ Usage:
     # Basic pre-submission check (no GPU needed):
     python evaluate.py --model-repo user/my-distilled-model
 
+    # Local checkpoint directory (same checks except Hugging Face hub access):
+    python evaluate.py --model-repo ./my-checkpoints/final
+
     # With specific revision:
     python evaluate.py --model-repo user/my-distilled-model --revision abc123
 
@@ -34,6 +37,7 @@ import time
 import random
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 import click
 
@@ -264,7 +268,11 @@ def align_student_logits_to_teacher_vocab(student_cont_logits, teacher_logits_fo
 
 
 @click.command()
-@click.option("--model-repo", required=True, help="HuggingFace repo (e.g. 'user/my-model')")
+@click.option(
+    "--model-repo",
+    required=True,
+    help="Hugging Face repo id (e.g. 'user/my-model') or path to a local model directory",
+)
 @click.option("--revision", default=None, help="Specific HF revision/commit SHA")
 @click.option("--eval", "run_eval", is_flag=True, default=False,
               help="Run a realistic eval against the teacher (requires GPU)")
@@ -307,56 +315,92 @@ def main(
     """
     from huggingface_hub import model_info as hf_model_info, hf_hub_download, repo_info
 
+    from eval.model_checker import (
+        compute_moe_params,
+        get_safetensors_param_count,
+        is_local_checkpoint_dir,
+        local_dir_siblings,
+    )
+
     max_params_b = TEACHER_TOTAL_PARAMS_B * MAX_PARAM_RATIO
     max_model_bytes = max_params_b * 2.2e9
 
     failures = []
     warnings = []
 
+    local_path = Path(model_repo).expanduser().resolve()
+    is_local = is_local_checkpoint_dir(model_repo)
+    model_ref = str(local_path) if is_local else model_repo
+    if is_local and revision:
+        check_warn("--revision", "Ignored when --model-repo is a local directory")
+        revision = None
+
+    resolved_revision = revision
+
+    # -- Resolve revision (Hub only) -------------------------------------------
+    if not is_local:
+        if not resolved_revision:
+            try:
+                resolved_revision = repo_info(model_repo, repo_type="model").sha
+            except Exception as e:
+                check_fail("Resolve revision", str(e))
+                failures.append(("revision", str(e)))
+                _print_summary(failures, warnings)
+                sys.exit(1)
+    else:
+        resolved_revision = None
+
     banner("PRE-SUBMISSION MODEL CHECKER")
     print(f"  Model: {model_repo}")
-    print(f"  Revision: {revision or '(latest)'}")
+    if is_local:
+        print(f"  Revision: (local directory)")
+    else:
+        rev_note = "user-specified" if revision else "pinned from repo latest"
+        print(f"  Hub revision: {resolved_revision[:12]}... ({rev_note})")
     print(f"  Max params: {max_params_b:.2f}B")
-
-    # -- Resolve revision -------------------------------------------------------
-    if not revision:
-        try:
-            info = repo_info(model_repo, repo_type="model")
-            revision = info.sha
-            print(f"  Pinned revision: {revision[:12]}...")
-        except Exception as e:
-            check_fail("Resolve revision", str(e))
-            failures.append(("revision", str(e)))
-            _print_summary(failures, warnings)
-            sys.exit(1)
+    if is_local:
+        print(f"  Resolved path: {local_path}")
 
     # ==========================================================================
     # CHECK 1: Repository accessibility
     # ==========================================================================
     banner("CHECK 1: Repository Accessibility")
-    try:
-        info = hf_model_info(model_repo, revision=revision, files_metadata=True)
-        if info.private:
-            check_fail("Public access", "Model is PRIVATE -- must be public")
-            failures.append(("accessibility", "Model is private"))
-        elif info.disabled:
-            check_fail("Public access", "Model is DISABLED on HuggingFace")
-            failures.append(("accessibility", "Model is disabled"))
-        else:
-            check_pass("Public access", "Model is publicly accessible")
-    except Exception as e:
-        err = str(e)
-        if "404" in err:
-            check_fail("Public access", "Model not found (404)")
-            failures.append(("accessibility", "Model not found"))
-        elif "403" in err:
-            check_fail("Public access", "Model is restricted/gated (403)")
-            failures.append(("accessibility", "Model is restricted"))
-        else:
-            check_fail("Public access", f"Error: {err}")
-            failures.append(("accessibility", err))
-        _print_summary(failures, warnings)
-        sys.exit(1)
+    if is_local:
+        check_pass(
+            "Local checkpoint",
+            "Skipping Hugging Face hub check — submission still needs a public model repo",
+        )
+        info = SimpleNamespace(
+            siblings=local_dir_siblings(local_path),
+            private=False,
+            disabled=False,
+        )
+    else:
+        try:
+            info = hf_model_info(
+                model_repo, revision=resolved_revision, files_metadata=True
+            )
+            if info.private:
+                check_fail("Public access", "Model is PRIVATE -- must be public")
+                failures.append(("accessibility", "Model is private"))
+            elif info.disabled:
+                check_fail("Public access", "Model is DISABLED on HuggingFace")
+                failures.append(("accessibility", "Model is disabled"))
+            else:
+                check_pass("Public access", "Model is publicly accessible")
+        except Exception as e:
+            err = str(e)
+            if "404" in err:
+                check_fail("Public access", "Model not found (404)")
+                failures.append(("accessibility", "Model not found"))
+            elif "403" in err:
+                check_fail("Public access", "Model is restricted/gated (403)")
+                failures.append(("accessibility", "Model is restricted"))
+            else:
+                check_fail("Public access", f"Error: {err}")
+                failures.append(("accessibility", err))
+            _print_summary(failures, warnings)
+            sys.exit(1)
 
     # ==========================================================================
     # CHECK 2: No custom code (security)
@@ -447,21 +491,26 @@ def main(
     # ==========================================================================
     banner("CHECK 4: Model Configuration")
     try:
-        config_path = hf_hub_download(
-            repo_id=model_repo, filename="config.json", revision=revision
-        )
+        if is_local:
+            config_path = local_path / "config.json"
+            if not config_path.is_file():
+                raise FileNotFoundError(f"Missing {config_path}")
+        else:
+            config_path = hf_hub_download(
+                repo_id=model_repo,
+                filename="config.json",
+                revision=resolved_revision,
+            )
         with open(config_path) as f:
             config = json.load(f)
-
-        # Import MoE param counter
-        sys.path.insert(0, str(Path(__file__).parent))
-        from eval.model_checker import compute_moe_params, get_safetensors_param_count
 
         moe_info = compute_moe_params(config)
         config_total_b = moe_info["total_params"] / 1e9
         config_active_b = moe_info["active_params"] / 1e9
 
-        safetensors_params_b = get_safetensors_param_count(model_repo, revision)
+        safetensors_params_b = get_safetensors_param_count(
+            model_ref, resolved_revision
+        )
         total_params_b = safetensors_params_b if safetensors_params_b > 0 else config_total_b
 
         check_info("Config total params", f"{config_total_b:.2f}B (from config)")
@@ -562,9 +611,13 @@ def main(
 
         teacher_tok = AutoTokenizer.from_pretrained(TEACHER_MODEL, trust_remote_code=True)
         try:
-            student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=False)
+            student_tok = AutoTokenizer.from_pretrained(
+                model_ref, revision=resolved_revision, trust_remote_code=False
+            )
         except Exception:
-            student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=True)
+            student_tok = AutoTokenizer.from_pretrained(
+                model_ref, revision=resolved_revision, trust_remote_code=True
+            )
 
         test_strings = [
             "The quick brown fox jumps over the lazy dog.",
@@ -599,7 +652,7 @@ def main(
     try:
         from eval.model_checker import compute_model_hash
 
-        model_hash = compute_model_hash(model_repo, revision)
+        model_hash = compute_model_hash(model_ref, resolved_revision)
         if model_hash:
             check_info("Model hash", f"{model_hash[:16]}...")
             hash_file = Path("state/model_hashes.json")
@@ -632,7 +685,7 @@ def main(
     try:
         from eval.model_checker import verify_model_integrity
 
-        integrity = verify_model_integrity(model_repo, revision)
+        integrity = verify_model_integrity(model_ref, resolved_revision)
         if integrity["pass"]:
             check_pass("Integrity", "Model accessible and weights verifiable")
         else:
@@ -656,7 +709,7 @@ def main(
         print("   Your model should be accepted by the validator.")
         print()
         print("   TIP: Run with --eval to test KL divergence on GPU:")
-        print(f"   python evaluate.py --model-repo {model_repo} --eval")
+        print(f"   python evaluate.py --model-repo {model_ref} --eval")
         sys.exit(0)
 
     # ==========================================================================
@@ -814,8 +867,8 @@ def main(
         t0 = time.time()
         try:
             student = AutoModelForCausalLM.from_pretrained(
-                model_repo,
-                revision=revision,
+                model_ref,
+                revision=resolved_revision,
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
                 trust_remote_code=False,
@@ -823,8 +876,8 @@ def main(
             )
         except Exception:
             student = AutoModelForCausalLM.from_pretrained(
-                model_repo,
-                revision=revision,
+                model_ref,
+                revision=resolved_revision,
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
                 trust_remote_code=False,

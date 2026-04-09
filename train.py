@@ -6,10 +6,15 @@ Train a student model to match the teacher's (Qwen3.5-35B-A3B) output distributi
 using forward KL divergence on random prompts from karpathy/climbmix-400b-shuffle.
 
 Requirements:
-    pip install transformers>=5.3.0 torch datasets
+    pip install transformers>=5.3.0 torch datasets huggingface-hub
+
+Saved checkpoints rewrite config.json to Qwen3_5ForConditionalGeneration layout and add
+preprocessor_config.json so ``evaluate.py`` / the validator see the expected Hub format.
 
 Usage (2 GPUs - teacher on GPU 0, student on GPU 1):
     python train.py --teacher_gpu 0 --student_gpu 1
+
+If only one CUDA device is available, invalid GPU indices automatically enable --single_gpu.
 
 Usage (start from a specific base model):
     python train.py --student some_user/their_model --teacher_gpu 0 --student_gpu 1
@@ -36,10 +41,12 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
+import copy
 import gc
 import json
 import logging
 import random
+import shutil
 import time
 
 import torch
@@ -70,6 +77,65 @@ MAX_SEQ_LEN = 640
 KL_START_POS = 128
 PROMPTS_PER_STEP = 60
 SAVE_EVERY = 500
+
+# Hugging Face repo to copy preprocessor_config.json from (matches evaluate.py hint).
+_PREPROCESSOR_TEMPLATE_REPO = "Qwen/Qwen3.5-4B"
+
+
+def finalize_checkpoint_for_submission(checkpoint_dir: str) -> None:
+    """Rewrite config.json into Qwen3_5ForConditionalGeneration layout and ensure preprocessor.
+
+    ``AutoModelForCausalLM.save_pretrained`` writes a flat causal LM config; validators expect
+    top-level ``model_type: qwen3_5`` + ``Qwen3_5ForConditionalGeneration`` with the same JSON
+    nested under ``text_config`` (see successful Hub submissions). Weight keys already use
+    ``model.language_model.*`` for Qwen3.5 students, so only metadata + preprocessor need fixing.
+    """
+    cfg_path = os.path.join(checkpoint_dir, "config.json")
+    if not os.path.isfile(cfg_path):
+        return
+
+    with open(cfg_path) as f:
+        inner = json.load(f)
+
+    arch = inner.get("architectures") or []
+    if inner.get("model_type") == "qwen3_5" and "Qwen3_5ForConditionalGeneration" in arch:
+        pass  # already wrapped; still ensure preprocessor below
+    elif inner.get("text_config") is not None:
+        # Unusual: partially wrapped; do not replace.
+        log.warning("config.json has text_config but not submission arch layout; skipping rewrite: %s", checkpoint_dir)
+    else:
+        text_config = copy.deepcopy(inner)
+        outer = {
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "text_config": text_config,
+            "tie_word_embeddings": text_config.get("tie_word_embeddings", False),
+        }
+        if text_config.get("dtype"):
+            outer["torch_dtype"] = text_config["dtype"]
+        if text_config.get("transformers_version"):
+            outer["transformers_version"] = text_config["transformers_version"]
+
+        with open(cfg_path, "w") as f:
+            json.dump(outer, f, indent=2)
+            f.write("\n")
+        log.info("  Wrote submission-style config (Qwen3_5ForConditionalGeneration + text_config)")
+
+    pre = os.path.join(checkpoint_dir, "preprocessor_config.json")
+    if os.path.isfile(pre):
+        return
+    try:
+        from huggingface_hub import hf_hub_download
+
+        src = hf_hub_download(_PREPROCESSOR_TEMPLATE_REPO, "preprocessor_config.json")
+        shutil.copy(src, pre)
+        log.info("  Copied preprocessor_config.json from %s", _PREPROCESSOR_TEMPLATE_REPO)
+    except Exception as e:
+        log.warning(
+            "  Could not add preprocessor_config.json (evaluate.py expects it): %s — copy manually from %s",
+            e,
+            _PREPROCESSOR_TEMPLATE_REPO,
+        )
 
 
 class RandomPromptSampler:
@@ -245,6 +311,25 @@ def main():
                         help="Disable wandb logging")
 
     args = parser.parse_args()
+
+    if torch.cuda.is_available():
+        n_gpu = torch.cuda.device_count()
+        if not args.single_gpu and (
+            args.teacher_gpu < 0
+            or args.student_gpu < 0
+            or args.teacher_gpu >= n_gpu
+            or args.student_gpu >= n_gpu
+        ):
+            log.warning(
+                "CUDA devices: %d; teacher_gpu=%s and student_gpu=%s are not all valid. "
+                "Using --single_gpu (device_map='auto' for both models). "
+                "For two GPUs, pass e.g. --teacher_gpu 0 --student_gpu 1.",
+                n_gpu,
+                args.teacher_gpu,
+                args.student_gpu,
+            )
+            args.single_gpu = True
+
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Save config
@@ -414,6 +499,7 @@ def main():
             os.makedirs(d, exist_ok=True)
             student.save_pretrained(d, safe_serialization=True)
             tokenizer.save_pretrained(d)
+            finalize_checkpoint_for_submission(d)
             torch.save(optimizer.state_dict(), os.path.join(d, "optimizer.pt"))
             with open(os.path.join(d, "train_state.json"), "w") as f:
                 json.dump({
@@ -433,6 +519,7 @@ def main():
     os.makedirs(final_dir, exist_ok=True)
     student.save_pretrained(final_dir, safe_serialization=True)
     tokenizer.save_pretrained(final_dir)
+    finalize_checkpoint_for_submission(final_dir)
     log.info(f"Training complete at step {global_step}. Final model saved to {final_dir}")
 
     if not args.no_wandb:
