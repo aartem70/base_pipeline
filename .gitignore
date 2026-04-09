@@ -43,6 +43,9 @@ htmlcov/
 # Jupyter
 .ipynb_checkpoints/
 
+# Training checkpoints
+distil-checkpoints/
+
 # OS
 .DS_Store
 Thumbs.db
