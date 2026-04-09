@@ -41,7 +41,13 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # Files to skip uploading (not needed for submission, waste space)
-SKIP_FILES = {"optimizer.pt", "train_state.json", "train_config.json"}
+SKIP_FILES = {
+    "optimizer.pt",
+    "train_state.json",
+    "train_config.json",
+    "train_metrics.csv",
+    "train_curves.png",
+}
 
 
 def main():

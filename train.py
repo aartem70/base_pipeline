@@ -45,6 +45,10 @@ Stability:
 Output:
     By default the entire ``--output_dir`` is deleted before a new run. Use ``--resume-from``
     or ``--no-clean-output`` to preserve it.
+
+    Each step appends one row to ``output_dir/train_metrics.csv`` and, when matplotlib is
+    available, writes ``output_dir/train_curves.png`` (KL + LR vs step). Use ``--no_train_plots``
+    to disable, or ``--plot_every N`` to refresh the PNG during training.
 """
 
 import os
@@ -52,6 +56,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
 import copy
+import csv
 import gc
 import json
 import logging
@@ -91,6 +96,10 @@ SAVE_EVERY = 500
 
 # Hugging Face repo to copy preprocessor_config.json from (matches evaluate.py hint).
 _PREPROCESSOR_TEMPLATE_REPO = "Qwen/Qwen3.5-4B"
+
+TRAIN_METRICS_CSV = "train_metrics.csv"
+TRAIN_CURVES_PNG = "train_curves.png"
+_TRAIN_METRIC_FIELDS = ("step", "kl", "lr", "step_time_s", "samples_per_sec", "total_sampled")
 
 
 def finalize_checkpoint_for_submission(checkpoint_dir: str) -> None:
@@ -291,6 +300,69 @@ def kl_loss(student_logits, teacher_logits, start_pos=KL_START_POS):
     return (t_p * (t_log_p - s_log_p)).sum(-1).mean()
 
 
+def _load_train_metrics_csv(path: str) -> list:
+    """Load previous metrics rows for resume (plot continues across restarts)."""
+    if not os.path.isfile(path):
+        return []
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames != list(_TRAIN_METRIC_FIELDS):
+            log.warning(
+                "train_metrics.csv header mismatch; not loading prior rows: %s",
+                path,
+            )
+            return []
+        return [dict(row) for row in reader]
+
+
+def _append_train_metric_row(csv_path: str, row: dict) -> None:
+    new_file = not os.path.isfile(csv_path) or os.path.getsize(csv_path) == 0
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_TRAIN_METRIC_FIELDS)
+        if new_file:
+            writer.writeheader()
+        writer.writerow({k: row[k] for k in _TRAIN_METRIC_FIELDS})
+
+
+def save_train_curves_plot(output_dir: str, history: list) -> None:
+    """Write train_curves.png: train KL and LR vs global step (non-interactive backend)."""
+    if not history:
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        log.warning(
+            "matplotlib not installed; skipping %s (pip install matplotlib)",
+            TRAIN_CURVES_PNG,
+        )
+        return
+
+    steps = [int(h["step"]) for h in history]
+    kls = [float(h["kl"]) for h in history]
+    lrs = [float(h["lr"]) for h in history]
+
+    fig, ax1 = plt.subplots(figsize=(8, 4))
+    fig.patch.set_facecolor("white")
+    ax1.set_facecolor("white")
+    ax1.set_xlabel("step")
+    ax1.set_ylabel("train KL", color="C0")
+    ax1.plot(steps, kls, color="C0")
+    ax1.tick_params(axis="y", labelcolor="C0")
+    ax2 = ax1.twinx()
+    ax2.set_ylabel("learning rate", color="C1")
+    ax2.plot(steps, lrs, color="C1", linestyle="--", alpha=0.85)
+    ax2.tick_params(axis="y", labelcolor="C1")
+    fig.suptitle("Training curves")
+    fig.tight_layout()
+    out_path = os.path.join(output_dir, TRAIN_CURVES_PNG)
+    fig.savefig(out_path, dpi=120, facecolor="white", edgecolor="none")
+    plt.close(fig)
+    log.info("  Wrote %s", out_path)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="KL Distillation Training",
@@ -343,6 +415,10 @@ def main():
     parser.add_argument("--wandb_run", type=str, default=None)
     parser.add_argument("--no_wandb", action="store_true",
                         help="Disable wandb logging")
+    parser.add_argument("--no_train_plots", action="store_true",
+                        help="Do not write train_metrics.csv or train_curves.png")
+    parser.add_argument("--plot_every", type=int, default=0,
+                        help="Rewrite train_curves.png every N steps (0 = only at training end)")
 
     args = parser.parse_args()
 
@@ -470,6 +546,17 @@ def main():
             global_step = state.get("global_step", 0)
             log.info(f"  Resuming from step {global_step}")
 
+    metrics_csv_path = os.path.join(args.output_dir, TRAIN_METRICS_CSV)
+    train_history = []
+    if args.resume_from and os.path.isfile(metrics_csv_path) and not args.no_train_plots:
+        train_history = _load_train_metrics_csv(metrics_csv_path)
+        if train_history:
+            log.info(
+                "  Loaded %d prior rows from %s for curve/plot continuity",
+                len(train_history),
+                metrics_csv_path,
+            )
+
     # ── Prompt sampler ────────────────────────────────────────────────────
     sampler = RandomPromptSampler(seed=args.seed)
     cached_texts = None
@@ -550,6 +637,20 @@ def main():
                        "perf/step_time": elapsed, "perf/samples_per_sec": n / elapsed,
                        "data/total_sampled": sampler.total_sampled}, step=global_step)
 
+        if not args.no_train_plots:
+            metric_row = {
+                "step": global_step,
+                "kl": f"{avg_kl:.6f}",
+                "lr": f"{lr:.10e}",
+                "step_time_s": f"{elapsed:.4f}",
+                "samples_per_sec": f"{(n / elapsed):.4f}" if elapsed > 0 else "0",
+                "total_sampled": sampler.total_sampled,
+            }
+            train_history.append(metric_row)
+            _append_train_metric_row(metrics_csv_path, metric_row)
+            if args.plot_every > 0 and global_step % args.plot_every == 0:
+                save_train_curves_plot(args.output_dir, train_history)
+
         if avg_kl < best_train_kl:
             best_train_kl = avg_kl
             save_student_checkpoint(
@@ -567,6 +668,9 @@ def main():
         if global_step % 10 == 0:
             gc.collect()
             torch.cuda.empty_cache()
+
+    if not args.no_train_plots and train_history:
+        save_train_curves_plot(args.output_dir, train_history)
 
     # Final save (last weights after last optimizer step — may be worse than best_train_kl/)
     save_student_checkpoint(
