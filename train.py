@@ -91,7 +91,6 @@ STUDENT_MODEL = "Qwen/Qwen3.5-4B"
 # Dataset
 CLIMBMIX_DATASET = "karpathy/climbmix-400b-shuffle"
 CLIMBMIX_NUM_SHARDS = 6542
-FINEWEB_DATASET = "HuggingFaceFW/fineweb"
 
 # Training defaults
 LR = 1e-4
@@ -181,7 +180,7 @@ def save_student_checkpoint(
 
 
 class RandomPromptSampler:
-    """Samples random prompts from ClimbMix shards, with FineWeb fallback."""
+    """Samples random prompts from ClimbMix shards only."""
 
     def __init__(self, seed=42, min_chars=2560, max_chars=10000):
         self._rng = random.Random(seed)
@@ -191,8 +190,6 @@ class RandomPromptSampler:
         self._current_indices = []
         self._index_pos = 0
         self._total_sampled = 0
-        self._climbmix_sampled = 0
-        self._fineweb_sampled = 0
 
     def _load_shard(self):
         from datasets import load_dataset
@@ -201,63 +198,24 @@ class RandomPromptSampler:
         shard_file = f"shard_{shard_idx:05d}.parquet"
         log.info(f"Loading shard {shard_idx}/{CLIMBMIX_NUM_SHARDS} from {CLIMBMIX_DATASET}...")
 
-        try:
-            ds = load_dataset(
-                CLIMBMIX_DATASET,
-                data_files=shard_file,
-                split="train",
-            )
-            indices = list(range(len(ds)))
-            self._rng.shuffle(indices)
-            self._current_shard = ds
-            self._current_indices = indices
-            self._index_pos = 0
-            log.info(f"  Shard {shard_idx} loaded: {len(ds)} rows")
-            return True
-        except Exception as e:
-            log.warning(f"  Failed to load shard {shard_idx}: {e}")
-            return False
-
-    def _load_fineweb_fallback(self, n):
-        from datasets import load_dataset
-
-        skip_offset = self._rng.randint(0, 5_000_000)
-        log.info(f"Fallback: sampling from {FINEWEB_DATASET} (skip={skip_offset:,})...")
-
-        ds = load_dataset(FINEWEB_DATASET, split="train", streaming=True, name="default")
-        ds_shuffled = ds.shuffle(seed=self._rng.randint(0, 2**31), buffer_size=50_000)
-        ds_skipped = ds_shuffled.skip(skip_offset)
-
-        texts = []
-        seen = 0
-        for item in ds_skipped:
-            seen += 1
-            text = item.get("text", "")
-            if not text or len(text) < self._min_chars:
-                continue
-            if len(text) > self._max_chars:
-                text = text[:self._max_chars]
-                last_space = text.rfind(' ')
-                if last_space > self._max_chars // 2:
-                    text = text[:last_space]
-            texts.append(text)
-            if len(texts) >= n:
-                break
-            if seen > n * 20:
-                break
-
-        log.info(f"  FineWeb fallback got {len(texts)} prompts (scanned {seen})")
-        return texts
+        ds = load_dataset(
+            CLIMBMIX_DATASET,
+            data_files=shard_file,
+            split="train",
+        )
+        indices = list(range(len(ds)))
+        self._rng.shuffle(indices)
+        self._current_shard = ds
+        self._current_indices = indices
+        self._index_pos = 0
+        log.info(f"  Shard {shard_idx} loaded: {len(ds)} rows")
 
     def sample(self, n):
         texts = []
-        attempts = 0
 
-        while len(texts) < n and attempts < 5:
+        while len(texts) < n:
             if self._current_shard is None or self._index_pos >= len(self._current_indices):
-                if not self._load_shard():
-                    attempts += 1
-                    continue
+                self._load_shard()
 
             while len(texts) < n and self._index_pos < len(self._current_indices):
                 idx = self._current_indices[self._index_pos]
@@ -276,31 +234,12 @@ class RandomPromptSampler:
             if len(texts) < n:
                 self._current_shard = None
 
-        n_from_climbmix = len(texts)
-        if len(texts) < n:
-            fallback_texts = self._load_fineweb_fallback(n - len(texts))
-            texts.extend(fallback_texts)
-            self._fineweb_sampled += len(fallback_texts)
-            log.warning(
-                "FineWeb fallback used: %d/%d prompts from FineWeb (total FineWeb: %d)",
-                len(fallback_texts), n, self._fineweb_sampled,
-            )
-
-        self._climbmix_sampled += n_from_climbmix
         self._total_sampled += len(texts)
         return texts
 
     @property
     def total_sampled(self):
         return self._total_sampled
-
-    @property
-    def data_source_stats(self):
-        return {
-            "climbmix": self._climbmix_sampled,
-            "fineweb": self._fineweb_sampled,
-            "total": self._total_sampled,
-        }
 
 
 # -- Batched KL loss with padding mask -----------------------------------------
@@ -787,13 +726,6 @@ def main():
         )
     else:
         log.info("Training complete at step %d.", global_step)
-
-    stats = sampler.data_source_stats
-    log.info(
-        "Data source breakdown: ClimbMix=%d, FineWeb=%d (%.1f%% ClimbMix)",
-        stats["climbmix"], stats["fineweb"],
-        100 * stats["climbmix"] / max(stats["total"], 1),
-    )
 
     if not args.no_wandb:
         import wandb
