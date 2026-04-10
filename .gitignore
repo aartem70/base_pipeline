@@ -50,6 +50,9 @@ distil-checkpoints/
 .DS_Store
 Thumbs.db
 
+# CUDA keyring package (local install artifact)
+cuda-keyring_*.deb
+
 # IDEs
 .idea/
 .vscode/
