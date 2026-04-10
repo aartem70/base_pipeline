@@ -157,10 +157,18 @@ Using vLLM's pinned PyTorch version avoids this since vLLM targets stable releas
 
 ## Without vLLM (simpler setup)
 
-If you don't need vLLM, skip Step 3's vLLM install:
+If you don't need vLLM, skip Step 3's vLLM install. However, many GPU rental machines
+ship with bleeding-edge PyTorch (e.g., torch 2.11+cu130) that has no pre-built wheels
+for CUDA extensions. Downgrade to a stable version first:
 
 ```bash
+# Downgrade PyTorch to stable CUDA 12.6 build
+pip install torch==2.6.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+
+# Install remaining dependencies
 pip install -r requirements.txt
+
+# Install CUDA extensions (builds against torch 2.6)
 pip install flash-attn --no-build-isolation --no-cache-dir
 pip install causal-conv1d --no-build-isolation --no-cache-dir
 ```
