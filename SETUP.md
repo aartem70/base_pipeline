@@ -45,7 +45,15 @@ echo 'export CUDA_HOME=/usr/local/cuda-12.6' >> ~/.bashrc
 echo 'export PATH=/usr/lib/gcc/x86_64-linux-gnu/11:$CUDA_HOME/bin:$PATH' >> ~/.bashrc
 ```
 
-## Step 3: Install Python Packages (ORDER MATTERS)
+## Step 3: Install Base Python Packages
+
+```bash
+pip install -r requirements.txt
+```
+
+This is enough to start training. Everything below is optional acceleration.
+
+## Step 4: Acceleration Packages (optional, ORDER MATTERS)
 
 ```bash
 # 1. Install vLLM FIRST — it pins its own PyTorch version
@@ -57,18 +65,14 @@ python -c "import torch; print(torch.__version__, torch.version.cuda)"
 # 3. Install CUDA extensions AFTER vLLM (builds against vLLM's torch)
 pip install flash-attn --no-build-isolation --no-cache-dir
 pip install causal-conv1d --no-build-isolation --no-cache-dir
-
-# 4. Install remaining dependencies
-pip install -r requirements.txt
 ```
 
 Why this order:
 - vLLM controls the PyTorch + CUDA version
 - flash-attn and causal-conv1d compile native CUDA code against PyTorch's headers
 - If you install them before vLLM, vLLM will upgrade PyTorch and break the compiled binaries
-- requirements.txt is last because it won't overwrite existing packages
 
-## Step 4: Verify
+## Step 5: Verify
 
 ```bash
 # Check flash attention
