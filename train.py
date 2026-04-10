@@ -511,6 +511,8 @@ def main():
         sdev = torch.device(f"cuda:{args.student_gpu}")
 
     student.train()
+    student.gradient_checkpointing_enable()
+    log.info("  Gradient checkpointing enabled (trades compute for ~50%% less activation memory)")
     n_params = sum(p.numel() for p in student.parameters())
     n_trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
     log.info(f"  Student: {n_params:,} params ({n_trainable:,} trainable), "
