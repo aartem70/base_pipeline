@@ -1,0 +1,4 @@
+-r requirements.txt
+flash-attn>=2.5.0
+flash-linear-attention>=0.1.0
+causal-conv1d>=1.2.0
