@@ -82,16 +82,36 @@ print('OK')
 
 If `"fast path is not available"` warning is **gone**, everything is working.
 
-## vLLM Status (NOT COMPATIBLE YET)
+## Not Yet Available
 
-vLLM 0.19 requires `transformers<5`, but Qwen3.5 models need `transformers>=5`.
-These two requirements conflict — they cannot coexist in the same environment.
+### vLLM (transformers version conflict)
 
-The `--use_vllm` flag in train.py is implemented and ready, but unusable until
-vLLM releases a version that supports transformers 5.x. Check future vLLM releases.
+vLLM 0.18-0.19 all require `transformers<5`, but Qwen3.5 models need `transformers>=5`.
+These conflict and cannot coexist. The `--use_vllm` flag in train.py is implemented
+and ready, but unusable until vLLM releases a version that supports transformers 5.x.
 
-For now, training uses HuggingFace for the teacher forward pass, which works fine
-with flash-attn and causal-conv1d acceleration.
+Do NOT install vLLM — it will downgrade transformers and break model loading.
+
+### HuggingFace Accelerate (not useful for 2-GPU setup)
+
+HF Accelerate provides multi-GPU data parallelism, but only benefits setups with 4+
+GPUs where multiple student replicas can train in parallel. On our 2x A100 80GB setup,
+both GPUs are already dedicated (teacher on GPU 0, student on GPU 1), so Accelerate
+has nothing to parallelize.
+
+Would become useful with 4+ GPUs (e.g., 4x A100: teacher on GPU 0, 3 student replicas
+on GPUs 1-3 with gradient synchronization).
+
+### `undefined symbol` after installing/changing packages
+
+Any time PyTorch version changes (e.g., vLLM upgrades it), all CUDA extensions break.
+Rebuild them:
+
+```bash
+pip uninstall flash-attn causal-conv1d -y
+pip install flash-attn --no-build-isolation --no-cache-dir
+pip install causal-conv1d --no-build-isolation --no-cache-dir
+```
 
 ## Troubleshooting
 
@@ -115,14 +135,17 @@ nvcc --version                                         # System CUDA
 Install the CUDA toolkit version that matches PyTorch's. Or if the mismatch is small
 (e.g., 12.6 vs 12.8), it usually still works.
 
-### `ImportError: undefined symbol` in flash_attn_2_cuda.so
+### `ImportError: undefined symbol` in flash_attn or causal_conv1d .so files
 
-flash-attn was compiled against a different PyTorch version. Rebuild:
+These were compiled against a different PyTorch version. Rebuild both:
 
 ```bash
-pip uninstall flash-attn -y
+pip uninstall flash-attn causal-conv1d -y
 pip install flash-attn --no-build-isolation --no-cache-dir
+pip install causal-conv1d --no-build-isolation --no-cache-dir
 ```
+
+This happens every time PyTorch version changes (e.g., installing vLLM upgrades torch).
 
 ### `ModuleNotFoundError: No module named 'wheel'`
 
@@ -153,3 +176,4 @@ Happens with very new PyTorch+CUDA combos. Solution: downgrade PyTorch to 2.6+cu
 | `causal-conv1d` | Fast linear attention kernels | No (2x speedup) |
 | `flash-linear-attention` | Python wrappers for FLA | Installed with causal-conv1d |
 | `vllm` | Fast teacher inference | NOT COMPATIBLE (needs transformers 5.x support) |
+| `accelerate` | Multi-GPU data parallelism | NOT USEFUL (needs 4+ GPUs) |
