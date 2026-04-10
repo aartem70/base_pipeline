@@ -1,7 +1,6 @@
 # Environment Setup Guide
 
-IMPORTANT: Install order matters. vLLM pins its own PyTorch version, and all CUDA
-extensions must be built against that same version. Follow the steps in order.
+IMPORTANT: Install order matters. Follow the steps in order.
 
 ## Step 1: Basic Setup
 
@@ -45,34 +44,26 @@ echo 'export CUDA_HOME=/usr/local/cuda-12.6' >> ~/.bashrc
 echo 'export PATH=/usr/lib/gcc/x86_64-linux-gnu/11:$CUDA_HOME/bin:$PATH' >> ~/.bashrc
 ```
 
-## Step 3: Install Base Python Packages
+## Step 3: Install Python Packages
+
+Many GPU rental machines ship with bleeding-edge PyTorch (e.g., torch 2.11+cu130)
+that has no pre-built wheels for CUDA extensions. Downgrade to a stable version first:
 
 ```bash
+# 1. Downgrade PyTorch to stable CUDA 12.6 build
+pip install torch==2.6.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+
+# 2. Install base dependencies
 pip install -r requirements.txt
-```
 
-This is enough to start training. Everything below is optional acceleration.
-
-## Step 4: Acceleration Packages (optional, ORDER MATTERS)
-
-```bash
-# 1. Install vLLM FIRST — it pins its own PyTorch version
-pip install vllm
-
-# 2. Verify which PyTorch version vLLM installed
-python -c "import torch; print(torch.__version__, torch.version.cuda)"
-
-# 3. Install CUDA extensions AFTER vLLM (builds against vLLM's torch)
+# 3. Install CUDA extensions (builds against torch 2.6)
 pip install flash-attn --no-build-isolation --no-cache-dir
 pip install causal-conv1d --no-build-isolation --no-cache-dir
 ```
 
-Why this order:
-- vLLM controls the PyTorch + CUDA version
-- flash-attn and causal-conv1d compile native CUDA code against PyTorch's headers
-- If you install them before vLLM, vLLM will upgrade PyTorch and break the compiled binaries
+This gives you all acceleration features (flash attention + fast linear attention).
 
-## Step 5: Verify
+## Step 4: Verify
 
 ```bash
 # Check flash attention
@@ -87,12 +78,20 @@ x = torch.randint(0, 1000, (1, 32)).cuda()
 m(x)
 print('OK')
 "
-
-# Check vLLM
-python -c "from vllm import LLM; print('vLLM OK')"
 ```
 
 If `"fast path is not available"` warning is **gone**, everything is working.
+
+## vLLM Status (NOT COMPATIBLE YET)
+
+vLLM 0.19 requires `transformers<5`, but Qwen3.5 models need `transformers>=5`.
+These two requirements conflict — they cannot coexist in the same environment.
+
+The `--use_vllm` flag in train.py is implemented and ready, but unusable until
+vLLM releases a version that supports transformers 5.x. Check future vLLM releases.
+
+For now, training uses HuggingFace for the teacher forward pass, which works fine
+with flash-attn and causal-conv1d acceleration.
 
 ## Troubleshooting
 
@@ -125,56 +124,32 @@ pip uninstall flash-attn -y
 pip install flash-attn --no-build-isolation --no-cache-dir
 ```
 
-### vLLM upgraded my PyTorch and broke everything
-
-This is why install order matters. Start over:
-
-```bash
-pip uninstall flash-attn causal-conv1d -y
-pip install vllm
-pip install flash-attn --no-build-isolation --no-cache-dir
-pip install causal-conv1d --no-build-isolation --no-cache-dir
-```
-
 ### `ModuleNotFoundError: No module named 'wheel'`
 
 ```bash
 pip install wheel
 ```
 
+### `KeyError: 'qwen3_5'` or `Transformers does not recognize this architecture`
+
+Your transformers version is too old. Qwen3.5 needs transformers>=5.x:
+
+```bash
+pip install --upgrade transformers
+```
+
 ### Pre-built wheels not found (building from source fails)
 
-Happens with very new PyTorch+CUDA combos where no one has published wheels yet.
-Using vLLM's pinned PyTorch version avoids this since vLLM targets stable releases.
+Happens with very new PyTorch+CUDA combos. Solution: downgrade PyTorch to 2.6+cu126 (Step 3).
 
 ## Quick Reference
 
 | Package | What it does | Required? |
 |---------|-------------|-----------|
-| `vllm` | Fast teacher inference (2-5x), pins PyTorch | No (use --use_vllm flag) |
-| `torch` | ML framework (installed by vLLM) | Yes |
+| `torch` | ML framework | Yes |
+| `transformers` | Model loading (need >=5.x for Qwen3.5) | Yes |
+| `datasets` | ClimbMix data loading | Yes |
 | `flash-attn` | Fast full attention kernels | No (1.5x speedup) |
 | `causal-conv1d` | Fast linear attention kernels | No (2x speedup) |
 | `flash-linear-attention` | Python wrappers for FLA | Installed with causal-conv1d |
-| `transformers` | Model loading | Yes |
-| `datasets` | ClimbMix data loading | Yes |
-
-## Without vLLM (simpler setup)
-
-If you don't need vLLM, skip Step 3's vLLM install. However, many GPU rental machines
-ship with bleeding-edge PyTorch (e.g., torch 2.11+cu130) that has no pre-built wheels
-for CUDA extensions. Downgrade to a stable version first:
-
-```bash
-# Downgrade PyTorch to stable CUDA 12.6 build
-pip install torch==2.6.0+cu126 --index-url https://download.pytorch.org/whl/cu126
-
-# Install remaining dependencies
-pip install -r requirements.txt
-
-# Install CUDA extensions (builds against torch 2.6)
-pip install flash-attn --no-build-isolation --no-cache-dir
-pip install causal-conv1d --no-build-isolation --no-cache-dir
-```
-
-Training works without vLLM — just don't pass `--use_vllm`.
+| `vllm` | Fast teacher inference | NOT COMPATIBLE (needs transformers 5.x support) |
