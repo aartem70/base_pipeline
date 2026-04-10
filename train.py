@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-KL Distillation Training
+KL Distillation Training (v2 — batched, accelerated)
 
 Train a student model to match the teacher's (Qwen3.5-35B-A3B) output distribution
 using forward KL divergence on random prompts from karpathy/climbmix-400b-shuffle.
@@ -10,6 +10,13 @@ Requirements:
 
 Saved checkpoints rewrite config.json to Qwen3_5ForConditionalGeneration layout and add
 preprocessor_config.json so ``evaluate.py`` / the validator see the expected Hub format.
+
+Key optimizations over v1:
+    - Batched tokenization (single call, with padding)
+    - Batched forward passes (teacher + student) instead of sample-by-sample
+    - Masked KL computation (ignores padding tokens)
+    - Optional top-k distillation (--topk_distil K) to reduce cross-GPU bandwidth
+    - Flash attention enabled by default when available
 
 Usage (2 GPUs - teacher on GPU 0, student on GPU 1):
     python train.py --teacher_gpu 0 --student_gpu 1
@@ -35,6 +42,8 @@ Hyperparameters:
     --warmup_steps    LR warmup steps (default: 10)
     --max_seq_len     Max sequence length (default: 640)
     --kl_start_pos    Compute KL from this position onward (default: 128)
+    --batch_size      Micro-batch size for forward passes (default: 4)
+    --topk_distil     Transfer only top-K logits across GPUs (0 = full vocab, default: 0)
 
 Stability:
     On a single GPU, teacher+student ``device_map='auto'`` is fragile; if logged KL jumps
@@ -93,6 +102,7 @@ MAX_SEQ_LEN = 640
 KL_START_POS = 128
 PROMPTS_PER_STEP = 60
 SAVE_EVERY = 500
+BATCH_SIZE = 4
 
 # Hugging Face repo to copy preprocessor_config.json from (matches evaluate.py hint).
 _PREPROCESSOR_TEMPLATE_REPO = "Qwen/Qwen3.5-4B"
@@ -103,13 +113,7 @@ _TRAIN_METRIC_FIELDS = ("step", "kl", "lr", "step_time_s", "samples_per_sec", "t
 
 
 def finalize_checkpoint_for_submission(checkpoint_dir: str) -> None:
-    """Rewrite config.json into Qwen3_5ForConditionalGeneration layout and ensure preprocessor.
-
-    ``AutoModelForCausalLM.save_pretrained`` writes a flat causal LM config; validators expect
-    top-level ``model_type: qwen3_5`` + ``Qwen3_5ForConditionalGeneration`` with the same JSON
-    nested under ``text_config`` (see successful Hub submissions). Weight keys already use
-    ``model.language_model.*`` for Qwen3.5 students, so only metadata + preprocessor need fixing.
-    """
+    """Rewrite config.json into Qwen3_5ForConditionalGeneration layout and ensure preprocessor."""
     cfg_path = os.path.join(checkpoint_dir, "config.json")
     if not os.path.isfile(cfg_path):
         return
@@ -119,9 +123,8 @@ def finalize_checkpoint_for_submission(checkpoint_dir: str) -> None:
 
     arch = inner.get("architectures") or []
     if inner.get("model_type") == "qwen3_5" and "Qwen3_5ForConditionalGeneration" in arch:
-        pass  # already wrapped; still ensure preprocessor below
+        pass
     elif inner.get("text_config") is not None:
-        # Unusual: partially wrapped; do not replace.
         log.warning("config.json has text_config but not submission arch layout; skipping rewrite: %s", checkpoint_dir)
     else:
         text_config = copy.deepcopy(inner)
@@ -152,16 +155,14 @@ def finalize_checkpoint_for_submission(checkpoint_dir: str) -> None:
         log.info("  Copied preprocessor_config.json from %s", _PREPROCESSOR_TEMPLATE_REPO)
     except Exception as e:
         log.warning(
-            "  Could not add preprocessor_config.json (evaluate.py expects it): %s — copy manually from %s",
+            "  Could not add preprocessor_config.json (evaluate.py expects it): %s",
             e,
-            _PREPROCESSOR_TEMPLATE_REPO,
         )
 
 
 def save_student_checkpoint(
     student, tokenizer, optimizer, args, global_step, dest_name: str, total_sampled: int,
 ) -> str:
-    """Write student weights, tokenizer, submission config, optimizer, and train_state.json."""
     d = os.path.join(args.output_dir, dest_name)
     os.makedirs(d, exist_ok=True)
     student.save_pretrained(d, safe_serialization=True)
@@ -191,7 +192,6 @@ class RandomPromptSampler:
         self._total_sampled = 0
 
     def _load_shard(self):
-        """Load a random shard from ClimbMix."""
         from datasets import load_dataset
 
         shard_idx = self._rng.randint(0, CLIMBMIX_NUM_SHARDS - 1)
@@ -216,7 +216,6 @@ class RandomPromptSampler:
             return False
 
     def _load_fineweb_fallback(self, n):
-        """Fallback: stream from FineWeb."""
         from datasets import load_dataset
 
         skip_offset = self._rng.randint(0, 5_000_000)
@@ -248,18 +247,15 @@ class RandomPromptSampler:
         return texts
 
     def sample(self, n):
-        """Sample n random prompts."""
         texts = []
         attempts = 0
 
         while len(texts) < n and attempts < 5:
-            # Load a new shard if needed
             if self._current_shard is None or self._index_pos >= len(self._current_indices):
                 if not self._load_shard():
                     attempts += 1
                     continue
 
-            # Sample from current shard
             while len(texts) < n and self._index_pos < len(self._current_indices):
                 idx = self._current_indices[self._index_pos]
                 self._index_pos += 1
@@ -274,11 +270,9 @@ class RandomPromptSampler:
                         text = text[:last_space]
                 texts.append(text)
 
-            # If shard exhausted, load another
             if len(texts) < n:
                 self._current_shard = None
 
-        # Final fallback to FineWeb
         if len(texts) < n:
             texts.extend(self._load_fineweb_fallback(n - len(texts)))
 
@@ -290,27 +284,63 @@ class RandomPromptSampler:
         return self._total_sampled
 
 
-def kl_loss(student_logits, teacher_logits, start_pos=KL_START_POS):
-    """Forward KL(teacher || student) from start_pos onward."""
-    s = student_logits[:, start_pos:, :].contiguous()
-    t = teacher_logits[:, start_pos:, :].detach().to(s.device).contiguous()
-    t_log_p = F.log_softmax(t.float(), dim=-1)
-    s_log_p = F.log_softmax(s.float(), dim=-1)
-    t_p = t_log_p.exp()
-    return (t_p * (t_log_p - s_log_p)).sum(-1).mean()
+# -- Batched KL loss with padding mask -----------------------------------------
 
+def batched_kl_loss(student_logits, teacher_logits, attention_mask, start_pos=KL_START_POS):
+    """Forward KL(teacher || student) from start_pos onward, with padding mask.
+
+    Args:
+        student_logits: [B, L, V] student model logits
+        teacher_logits: [B, L, V] teacher model logits (already on student device)
+        attention_mask: [B, L] binary mask (1 = real token, 0 = padding)
+        start_pos: skip first N positions
+    """
+    s = student_logits[:, start_pos:, :].float()
+    t = teacher_logits[:, start_pos:, :].detach().float()
+    mask = attention_mask[:, start_pos:].float()  # [B, L-start_pos]
+
+    t_log_p = F.log_softmax(t, dim=-1)
+    s_log_p = F.log_softmax(s, dim=-1)
+    t_p = t_log_p.exp()
+
+    # KL per position: sum over vocab dim
+    kl_per_pos = (t_p * (t_log_p - s_log_p)).sum(dim=-1)  # [B, L-start_pos]
+
+    # Mask out padding positions
+    kl_per_pos = kl_per_pos * mask
+
+    # Mean over non-padding positions
+    n_valid = mask.sum()
+    if n_valid == 0:
+        return torch.tensor(0.0, device=s.device, requires_grad=True)
+    return kl_per_pos.sum() / n_valid
+
+
+def topk_compress(logits, k):
+    """Compress logits to top-k values and indices for bandwidth-efficient transfer.
+
+    Returns (values, indices) where values is [B, L, K] and indices is [B, L, K].
+    """
+    return torch.topk(logits, k=k, dim=-1)
+
+
+def topk_decompress(values, indices, vocab_size, device):
+    """Reconstruct full logits from top-k values and indices, filling rest with -inf."""
+    B, L, K = values.shape
+    full = torch.full((B, L, vocab_size), -1e10, device=device, dtype=values.dtype)
+    full.scatter_(-1, indices.to(device), values.to(device))
+    return full
+
+
+# -- CSV / plotting helpers ----------------------------------------------------
 
 def _load_train_metrics_csv(path: str) -> list:
-    """Load previous metrics rows for resume (plot continues across restarts)."""
     if not os.path.isfile(path):
         return []
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         if reader.fieldnames != list(_TRAIN_METRIC_FIELDS):
-            log.warning(
-                "train_metrics.csv header mismatch; not loading prior rows: %s",
-                path,
-            )
+            log.warning("train_metrics.csv header mismatch; not loading prior rows: %s", path)
             return []
         return [dict(row) for row in reader]
 
@@ -325,19 +355,14 @@ def _append_train_metric_row(csv_path: str, row: dict) -> None:
 
 
 def save_train_curves_plot(output_dir: str, history: list) -> None:
-    """Write train_curves.png: train KL and LR vs global step (non-interactive backend)."""
     if not history:
         return
     try:
         import matplotlib
-
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
-        log.warning(
-            "matplotlib not installed; skipping %s (pip install matplotlib)",
-            TRAIN_CURVES_PNG,
-        )
+        log.warning("matplotlib not installed; skipping %s", TRAIN_CURVES_PNG)
         return
 
     steps = [int(h["step"]) for h in history]
@@ -363,9 +388,11 @@ def save_train_curves_plot(output_dir: str, history: list) -> None:
     log.info("  Wrote %s", out_path)
 
 
+# -- Main ----------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(
-        description="KL Distillation Training",
+        description="KL Distillation Training (v2 — batched, accelerated)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     # Model args
@@ -390,6 +417,11 @@ def main():
                         help="Compute KL from this token position onward (skip early context)")
     parser.add_argument("--max_steps", type=int, default=0,
                         help="Stop after N steps (0 = run forever)")
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE,
+                        help="Micro-batch size for forward passes (adjust based on GPU memory)")
+    parser.add_argument("--topk_distil", type=int, default=0,
+                        help="Transfer only top-K logits between GPUs (0 = full vocab). "
+                             "Reduces cross-GPU bandwidth. Try 512 or 1024.")
 
     # Prompt sampling
     parser.add_argument("--prompts_per_step", type=int, default=PROMPTS_PER_STEP,
@@ -401,14 +433,13 @@ def main():
 
     # Output
     parser.add_argument("--output_dir", type=str, default="./distil-checkpoints",
-                        help="Directory to save checkpoints (removed and recreated each run unless "
-                             "--resume-from or --no-clean-output)")
+                        help="Directory to save checkpoints")
     parser.add_argument("--save_every", type=int, default=SAVE_EVERY,
-                        help="Save step_N/ every N steps (use 1 when max_steps is small)")
+                        help="Save step_N/ every N steps")
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Resume from a checkpoint directory (loads optimizer + step count)")
     parser.add_argument("--no-clean-output", action="store_true", dest="no_clean_output",
-                        help="Keep existing output_dir contents (default: delete output_dir when not resuming)")
+                        help="Keep existing output_dir contents")
 
     # Logging
     parser.add_argument("--wandb_project", type=str, default="distil-training")
@@ -432,21 +463,16 @@ def main():
         ):
             log.warning(
                 "CUDA devices: %d; teacher_gpu=%s and student_gpu=%s are not all valid. "
-                "Using --single_gpu (device_map='auto' for both models). "
-                "For two GPUs, pass e.g. --teacher_gpu 0 --student_gpu 1.",
-                n_gpu,
-                args.teacher_gpu,
-                args.student_gpu,
+                "Using --single_gpu.",
+                n_gpu, args.teacher_gpu, args.student_gpu,
             )
             args.single_gpu = True
 
     if args.max_steps > 0 and args.save_every > args.max_steps:
         log.warning(
             "save_every=%d > max_steps=%d: no step_* folders will be written; "
-            "only final/ (last weights). Use --save_every 1 to snapshot each step, "
-            "or rely on best_train_kl/ (best train KL so far).",
-            args.save_every,
-            args.max_steps,
+            "only final/ (last weights).",
+            args.save_every, args.max_steps,
         )
 
     out_abs = os.path.abspath(os.path.expanduser(args.output_dir))
@@ -454,12 +480,9 @@ def main():
         if os.path.isdir(out_abs):
             log.info("Clearing output directory: %s", out_abs)
             shutil.rmtree(out_abs)
-    elif args.resume_from and not args.no_clean_output:
-        log.info("Keeping output directory (training with --resume-from).")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Save config
     with open(os.path.join(args.output_dir, "train_config.json"), "w") as f:
         json.dump(vars(args), f, indent=2)
 
@@ -469,22 +492,32 @@ def main():
             import wandb
             wandb.init(project=args.wandb_project, name=args.wandb_run or "distil-kl", config=vars(args))
         except ImportError:
-            log.warning("wandb not installed, disabling logging. pip install wandb to enable.")
+            log.warning("wandb not installed, disabling logging.")
             args.no_wandb = True
 
-    # ── Load models ───────────────────────────────────────────────────────
+    # -- Load models -----------------------------------------------------------
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.teacher, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    # Try flash attention for both models
+    attn_kwargs = {}
+    try:
+        import flash_attn  # noqa: F401
+        attn_kwargs["attn_implementation"] = "flash_attention_2"
+        log.info("Flash Attention 2 available, enabling for both models.")
+    except ImportError:
+        log.info("Flash Attention not available, using default attention.")
 
     if args.single_gpu:
         log.info(f"Loading teacher ({args.teacher}) with device_map='auto'...")
         teacher = AutoModelForCausalLM.from_pretrained(
             args.teacher, dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
+            device_map="auto", trust_remote_code=True,
+            **attn_kwargs,
         )
         tdev = teacher.device if hasattr(teacher, 'device') else torch.device("cuda:0")
     else:
@@ -493,6 +526,7 @@ def main():
             args.teacher, dtype=torch.bfloat16,
             device_map={"": args.teacher_gpu},
             trust_remote_code=True,
+            **attn_kwargs,
         )
         tdev = torch.device(f"cuda:{args.teacher_gpu}")
 
@@ -505,8 +539,8 @@ def main():
         log.info(f"Loading student ({args.student}) with device_map='auto'...")
         student = AutoModelForCausalLM.from_pretrained(
             args.student, dtype=torch.bfloat16,
-            trust_remote_code=True,
-            device_map="auto",
+            trust_remote_code=True, device_map="auto",
+            **attn_kwargs,
         )
         sdev = student.device if hasattr(student, 'device') else torch.device("cuda:0")
     else:
@@ -514,6 +548,7 @@ def main():
         student = AutoModelForCausalLM.from_pretrained(
             args.student, dtype=torch.bfloat16,
             trust_remote_code=True,
+            **attn_kwargs,
         ).to(f"cuda:{args.student_gpu}")
         sdev = torch.device(f"cuda:{args.student_gpu}")
 
@@ -523,7 +558,10 @@ def main():
     log.info(f"  Student: {n_params:,} params ({n_trainable:,} trainable), "
              f"VRAM: {torch.cuda.memory_allocated(sdev)/1e9:.1f}GB")
 
-    # ── Optimizer & scheduler ─────────────────────────────────────────────
+    # Log optimization settings
+    log.info(f"  Batch size: {args.batch_size}, Top-k distil: {args.topk_distil or 'off (full vocab)'}")
+
+    # -- Optimizer & scheduler -------------------------------------------------
     optimizer = AdamW(
         [p for p in student.parameters() if p.requires_grad],
         lr=args.lr, weight_decay=args.weight_decay,
@@ -551,24 +589,25 @@ def main():
     if args.resume_from and os.path.isfile(metrics_csv_path) and not args.no_train_plots:
         train_history = _load_train_metrics_csv(metrics_csv_path)
         if train_history:
-            log.info(
-                "  Loaded %d prior rows from %s for curve/plot continuity",
-                len(train_history),
-                metrics_csv_path,
-            )
+            log.info("  Loaded %d prior rows from %s", len(train_history), metrics_csv_path)
 
-    # ── Prompt sampler ────────────────────────────────────────────────────
+    # -- Prompt sampler --------------------------------------------------------
     sampler = RandomPromptSampler(seed=args.seed)
     cached_texts = None
     best_train_kl = float("inf")
 
-    # ── Training loop ─────────────────────────────────────────────────────
+    vocab_size = teacher.config.vocab_size if hasattr(teacher.config, 'vocab_size') else 248320
+
+    # -- Training loop ---------------------------------------------------------
     log.info("=" * 60)
-    log.info("Starting training")
+    log.info("Starting training (v2 — batched)")
     log.info("=" * 60)
     log.info(f"  LR: {args.lr}, Warmup: {args.warmup_steps}, Prompts/step: {args.prompts_per_step}")
     log.info(f"  Seq len: {args.max_seq_len}, KL from pos {args.kl_start_pos}")
+    log.info(f"  Batch size: {args.batch_size}")
     log.info(f"  Seed: {args.seed}, Resample every: {args.resample_every} step(s)")
+    if args.topk_distil > 0:
+        log.info(f"  Top-k distillation: k={args.topk_distil} (transferring {args.topk_distil}/{vocab_size} logits)")
     if args.max_steps > 0:
         log.info(f"  Max steps: {args.max_steps}")
     log.info("")
@@ -579,45 +618,90 @@ def main():
 
         t0 = time.time()
 
-        # Sample prompts (resample or reuse cached)
+        # Sample prompts
         if cached_texts is None or global_step % args.resample_every == 0:
             cached_texts = sampler.sample(args.prompts_per_step)
             if not cached_texts:
                 log.warning("No prompts sampled, stopping.")
                 break
 
-        # Tokenize
-        tokens = [
-            tokenizer(t, return_tensors="pt", truncation=True,
-                      max_length=args.max_seq_len).input_ids.squeeze(0)
-            for t in cached_texts
-        ]
-        # Filter out sequences too short for KL computation
-        tokens = [t for t in tokens if t.shape[0] > args.kl_start_pos + 10]
+        # ── Batched tokenization ──────────────────────────────────────────
+        batch_enc = tokenizer(
+            cached_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=args.max_seq_len,
+        )
+        input_ids = batch_enc["input_ids"]          # [N, L]
+        attention_mask = batch_enc["attention_mask"]  # [N, L]
 
-        if not tokens:
-            log.warning(f"Step {global_step}: all prompts too short after tokenization, resampling...")
+        # Filter: keep only sequences long enough for KL
+        seq_lens = attention_mask.sum(dim=1)
+        keep = seq_lens > args.kl_start_pos + 10
+        input_ids = input_ids[keep]
+        attention_mask = attention_mask[keep]
+
+        if input_ids.shape[0] == 0:
+            log.warning(f"Step {global_step}: all prompts too short, resampling...")
             cached_texts = None
             continue
 
+        n_samples = input_ids.shape[0]
         optimizer.zero_grad()
         total_loss = 0.0
-        n = 0
+        n_batches = 0
 
-        for ids in tokens:
-            ids = ids.unsqueeze(0)
+        # ── Micro-batched forward passes ──────────────────────────────────
+        for i in range(0, n_samples, args.batch_size):
+            mb_ids = input_ids[i:i + args.batch_size]
+            mb_mask = attention_mask[i:i + args.batch_size]
+
+            # Teacher forward (no grad)
             with torch.no_grad():
-                t_logits = teacher(ids.to(tdev)).logits.to(sdev)
-            s_logits = student(ids.to(sdev)).logits
-            loss = kl_loss(s_logits, t_logits, start_pos=args.kl_start_pos)
-            (loss / len(tokens)).backward()
-            total_loss += loss.item()
-            n += 1
-            del t_logits, s_logits, loss
+                t_out = teacher(
+                    mb_ids.to(tdev),
+                    attention_mask=mb_mask.to(tdev),
+                )
 
-        avg_kl = total_loss / max(n, 1)
+                if args.topk_distil > 0:
+                    # Compress: only transfer top-k logits across GPUs
+                    topk_vals, topk_idx = topk_compress(t_out.logits, args.topk_distil)
+                    t_logits = topk_decompress(
+                        topk_vals, topk_idx, vocab_size, sdev,
+                    )
+                    del topk_vals, topk_idx
+                else:
+                    t_logits = t_out.logits.to(sdev)
+                del t_out
+
+            # Student forward (with grad)
+            s_out = student(
+                mb_ids.to(sdev),
+                attention_mask=mb_mask.to(sdev),
+            )
+            s_logits = s_out.logits
+            del s_out
+
+            # Masked KL loss
+            loss = batched_kl_loss(
+                s_logits, t_logits,
+                mb_mask.to(sdev),
+                start_pos=args.kl_start_pos,
+            )
+
+            # Scale loss by number of micro-batches for gradient accumulation
+            n_total_batches = math.ceil(n_samples / args.batch_size)
+            (loss / n_total_batches).backward()
+
+            total_loss += loss.item()
+            n_batches += 1
+
+            del t_logits, s_logits, loss, mb_ids, mb_mask
+
+        avg_kl = total_loss / max(n_batches, 1)
         if not math.isfinite(avg_kl):
-            log.error("Non-finite training KL; skipping optimizer update and stopping.")
+            log.error("Non-finite training KL; stopping.")
             optimizer.zero_grad(set_to_none=True)
             break
 
@@ -629,12 +713,12 @@ def main():
         elapsed = time.time() - t0
         lr = scheduler.get_last_lr()[0]
         log.info(f"Step {global_step} | KL: {avg_kl:.4f} | LR: {lr:.2e} | "
-                 f"{elapsed:.1f}s ({n/elapsed:.1f} samp/s) | total_sampled: {sampler.total_sampled:,}")
+                 f"{elapsed:.1f}s ({n_samples/elapsed:.1f} samp/s) | total_sampled: {sampler.total_sampled:,}")
 
         if not args.no_wandb:
             import wandb
             wandb.log({"train/kl": avg_kl, "train/lr": lr,
-                       "perf/step_time": elapsed, "perf/samples_per_sec": n / elapsed,
+                       "perf/step_time": elapsed, "perf/samples_per_sec": n_samples / elapsed,
                        "data/total_sampled": sampler.total_sampled}, step=global_step)
 
         if not args.no_train_plots:
@@ -643,7 +727,7 @@ def main():
                 "kl": f"{avg_kl:.6f}",
                 "lr": f"{lr:.10e}",
                 "step_time_s": f"{elapsed:.4f}",
-                "samples_per_sec": f"{(n / elapsed):.4f}" if elapsed > 0 else "0",
+                "samples_per_sec": f"{(n_samples / elapsed):.4f}" if elapsed > 0 else "0",
                 "total_sampled": sampler.total_sampled,
             }
             train_history.append(metric_row)
@@ -672,7 +756,6 @@ def main():
     if not args.no_train_plots and train_history:
         save_train_curves_plot(args.output_dir, train_history)
 
-    # Final save (last weights after last optimizer step — may be worse than best_train_kl/)
     save_student_checkpoint(
         student, tokenizer, optimizer, args, global_step,
         "final", sampler.total_sampled,
@@ -681,8 +764,7 @@ def main():
         log.info(
             "Training complete at step %d. For eval, prefer best_train_kl/ if train KL spiked "
             "(best train KL was %.4f; see final/ for last step only).",
-            global_step,
-            best_train_kl,
+            global_step, best_train_kl,
         )
     else:
         log.info("Training complete at step %d.", global_step)
