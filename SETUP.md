@@ -89,6 +89,22 @@ print('OK')
 
 If `"fast path is not available"` warning is **gone**, you're good.
 
+## Step 3: vLLM for Fast Teacher Inference (optional)
+
+vLLM speeds up the teacher forward pass by 2-5x. Requires `--use_vllm` flag in train.py.
+
+```bash
+pip install vllm
+```
+
+Then use in training:
+
+```bash
+python train.py --use_vllm --teacher_gpu 0 --student_gpu 1 ...
+```
+
+Note: vLLM automatically sets `--topk_distil 512` since it returns log-probabilities, not full logits.
+
 ## Troubleshooting
 
 ### `nvcc: cannot execute 'cc1plus'`
@@ -131,4 +147,4 @@ This happens with very new PyTorch+CUDA combos. Solution: downgrade PyTorch (Ste
 | `causal-conv1d` | Fast linear attention kernels | No (2x speedup) |
 | `flash-attn` | Fast full attention kernels | No (1.5x speedup) |
 | `flash-linear-attention` | Python wrappers for FLA | Installed with causal-conv1d |
-| `vllm` | Fast teacher inference | No (future, requires code flag --use_vllm) |
+| `vllm` | Fast teacher inference (2-5x) | No (use --use_vllm flag) |
