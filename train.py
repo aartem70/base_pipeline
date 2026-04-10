@@ -290,6 +290,89 @@ def topk_decompress(values, indices, vocab_size, device):
     return full
 
 
+# -- vLLM teacher wrapper ------------------------------------------------------
+
+class VLLMTeacher:
+    """Wraps vLLM engine for fast teacher logit extraction.
+
+    Uses vLLM's prompt_logprobs to get teacher's token-level log-probabilities
+    without autoregressive generation. Much faster than HuggingFace forward pass
+    due to PagedAttention, continuous batching, and optimized CUDA kernels.
+    """
+
+    def __init__(self, model_name, gpu_id=0, gpu_memory_utilization=0.90, topk=512):
+        from vllm import LLM
+
+        self.topk = topk
+        self.model_name = model_name
+        log.info(f"Loading teacher via vLLM ({model_name}) on GPU {gpu_id}...")
+        log.info(f"  gpu_memory_utilization={gpu_memory_utilization}, prompt_logprobs top-k={topk}")
+
+        # vLLM uses CUDA_VISIBLE_DEVICES or tensor_parallel for GPU placement
+        self.llm = LLM(
+            model=model_name,
+            dtype="bfloat16",
+            gpu_memory_utilization=gpu_memory_utilization,
+            tensor_parallel_size=1,
+            trust_remote_code=True,
+            enforce_eager=True,  # avoid CUDA graph overhead for variable-length prompts
+        )
+        log.info("  vLLM teacher loaded.")
+
+    def get_logits(self, input_ids_batch, attention_mask_batch, vocab_size, device):
+        """Get teacher logits for a batch of token sequences.
+
+        Args:
+            input_ids_batch: [B, L] tensor of token ids
+            attention_mask_batch: [B, L] tensor (1=real, 0=pad)
+            vocab_size: full vocabulary size
+            device: target device for output tensor
+
+        Returns:
+            [B, L, vocab_size] tensor of logits on target device (sparse, top-k filled)
+        """
+        from vllm import SamplingParams
+        import torch
+
+        B, L = input_ids_batch.shape
+        k = min(self.topk, vocab_size)
+
+        # Convert padded batch to list of variable-length token id lists
+        prompt_token_ids = []
+        for i in range(B):
+            seq_len = attention_mask_batch[i].sum().item()
+            ids = input_ids_batch[i, :seq_len].tolist()
+            prompt_token_ids.append(ids)
+
+        # Use prompt_logprobs to get teacher's view of each input token
+        params = SamplingParams(
+            max_tokens=1,
+            temperature=0,
+            prompt_logprobs=k,
+        )
+        outputs = self.llm.generate(
+            prompt_token_ids=prompt_token_ids,
+            sampling_params=params,
+        )
+
+        # Reconstruct logits tensor [B, L, V] from prompt_logprobs
+        # vLLM returns prompt_logprobs as list of dicts per position
+        full_logits = torch.full((B, L, vocab_size), -1e10, dtype=torch.bfloat16, device=device)
+
+        for b, output in enumerate(outputs):
+            plogprobs = output.prompt_logprobs  # list of (dict or None) per position
+            if plogprobs is None:
+                continue
+            for pos, token_logprobs in enumerate(plogprobs):
+                if token_logprobs is None:
+                    continue  # first position has no logprobs
+                for token_id, logprob_obj in token_logprobs.items():
+                    lp = logprob_obj.logprob if hasattr(logprob_obj, 'logprob') else logprob_obj
+                    full_logits[b, pos, token_id] = lp
+
+        return full_logits
+
+
 # -- CSV / plotting helpers ----------------------------------------------------
 
 def _load_train_metrics_csv(path: str) -> list:
@@ -380,6 +463,12 @@ def main():
     parser.add_argument("--topk_distil", type=int, default=0,
                         help="Transfer only top-K logits between GPUs (0 = full vocab). "
                              "Reduces cross-GPU bandwidth. Try 512 or 1024.")
+    parser.add_argument("--use_vllm", action="store_true",
+                        help="Use vLLM for teacher inference (2-5x faster). "
+                             "Requires: pip install vllm. Teacher runs as vLLM engine "
+                             "instead of HuggingFace model.")
+    parser.add_argument("--vllm_gpu_util", type=float, default=0.90,
+                        help="vLLM gpu_memory_utilization (0-1). Lower if OOM.")
 
     # Prompt sampling
     parser.add_argument("--prompts_per_step", type=int, default=PROMPTS_PER_STEP,
@@ -461,37 +550,62 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # Try flash attention for both models
+    # Try flash attention for student (and teacher if not using vLLM)
     attn_kwargs = {}
     try:
         import flash_attn  # noqa: F401
         attn_kwargs["attn_implementation"] = "flash_attention_2"
-        log.info("Flash Attention 2 available, enabling for both models.")
+        log.info("Flash Attention 2 available.")
     except ImportError:
         log.info("Flash Attention not available, using default attention.")
 
-    if args.single_gpu:
-        log.info(f"Loading teacher ({args.teacher}) with device_map='auto'...")
-        teacher = AutoModelForCausalLM.from_pretrained(
-            args.teacher, dtype=torch.bfloat16,
-            device_map="auto", trust_remote_code=True,
-            **attn_kwargs,
-        )
-        tdev = teacher.device if hasattr(teacher, 'device') else torch.device("cuda:0")
-    else:
-        log.info(f"Loading teacher ({args.teacher}) on GPU {args.teacher_gpu}...")
-        teacher = AutoModelForCausalLM.from_pretrained(
-            args.teacher, dtype=torch.bfloat16,
-            device_map={"": args.teacher_gpu},
-            trust_remote_code=True,
-            **attn_kwargs,
-        )
-        tdev = torch.device(f"cuda:{args.teacher_gpu}")
+    # -- Load teacher ----------------------------------------------------------
+    vllm_teacher = None
 
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
-    log.info(f"  Teacher VRAM: {torch.cuda.memory_allocated(tdev)/1e9:.1f}GB")
+    if args.use_vllm:
+        # vLLM manages its own GPU placement
+        topk_for_vllm = args.topk_distil if args.topk_distil > 0 else 512
+        if args.topk_distil == 0:
+            log.warning(
+                "--use_vllm requires top-k logit extraction. Setting --topk_distil=%d "
+                "(vLLM returns log-probabilities, not raw logits for full vocab).",
+                topk_for_vllm,
+            )
+            args.topk_distil = topk_for_vllm
+
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.teacher_gpu)
+        vllm_teacher = VLLMTeacher(
+            args.teacher,
+            gpu_id=args.teacher_gpu,
+            gpu_memory_utilization=args.vllm_gpu_util,
+            topk=args.topk_distil,
+        )
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        teacher = None
+        tdev = None
+    else:
+        if args.single_gpu:
+            log.info(f"Loading teacher ({args.teacher}) with device_map='auto'...")
+            teacher = AutoModelForCausalLM.from_pretrained(
+                args.teacher, dtype=torch.bfloat16,
+                device_map="auto", trust_remote_code=True,
+                **attn_kwargs,
+            )
+            tdev = teacher.device if hasattr(teacher, 'device') else torch.device("cuda:0")
+        else:
+            log.info(f"Loading teacher ({args.teacher}) on GPU {args.teacher_gpu}...")
+            teacher = AutoModelForCausalLM.from_pretrained(
+                args.teacher, dtype=torch.bfloat16,
+                device_map={"": args.teacher_gpu},
+                trust_remote_code=True,
+                **attn_kwargs,
+            )
+            tdev = torch.device(f"cuda:{args.teacher_gpu}")
+
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+        log.info(f"  Teacher VRAM: {torch.cuda.memory_allocated(tdev)/1e9:.1f}GB")
 
     if args.single_gpu:
         log.info(f"Loading student ({args.student}) with device_map='auto'...")
@@ -619,21 +733,27 @@ def main():
 
             # Teacher forward (no grad)
             with torch.no_grad():
-                t_out = teacher(
-                    mb_ids.to(tdev),
-                    attention_mask=mb_mask.to(tdev),
-                )
-
-                if args.topk_distil > 0:
-                    # Compress: only transfer top-k logits across GPUs
-                    topk_vals, topk_idx = topk_compress(t_out.logits, args.topk_distil)
-                    t_logits = topk_decompress(
-                        topk_vals, topk_idx, vocab_size, sdev,
+                if vllm_teacher is not None:
+                    # vLLM path: returns logits directly on student device
+                    t_logits = vllm_teacher.get_logits(
+                        mb_ids, mb_mask, vocab_size, sdev,
                     )
-                    del topk_vals, topk_idx
                 else:
-                    t_logits = t_out.logits.to(sdev)
-                del t_out
+                    # HuggingFace path
+                    t_out = teacher(
+                        mb_ids.to(tdev),
+                        attention_mask=mb_mask.to(tdev),
+                    )
+
+                    if args.topk_distil > 0:
+                        topk_vals, topk_idx = topk_compress(t_out.logits, args.topk_distil)
+                        t_logits = topk_decompress(
+                            topk_vals, topk_idx, vocab_size, sdev,
+                        )
+                        del topk_vals, topk_idx
+                    else:
+                        t_logits = t_out.logits.to(sdev)
+                    del t_out
 
             # Student forward (with grad)
             s_out = student(
