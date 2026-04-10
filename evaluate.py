@@ -923,34 +923,58 @@ def main(
         # -- Score KL divergence (continuation-only, matches production) --------
         banner("CHECK 10: KL Divergence Scoring")
 
+        # Batch student forward passes for speed
+        EVAL_BATCH_SIZE = 4
         kl_scores = []
-        for i in range(len(eval_prompts)):
-            full_seq = full_sequences[i]
-            prompt_len = prompt_lens_list[i]
+        n_eval = len(eval_prompts)
 
-            t_logits = teacher_logits_list[i].to(student.device).float()
-            t_log_p = F.log_softmax(t_logits, dim=-1)
+        for batch_start in range(0, n_eval, EVAL_BATCH_SIZE):
+            batch_end = min(batch_start + EVAL_BATCH_SIZE, n_eval)
+            batch_seqs = full_sequences[batch_start:batch_end]
+            batch_prompt_lens = prompt_lens_list[batch_start:batch_end]
+            batch_teacher_logits = teacher_logits_list[batch_start:batch_end]
+
+            # Pad sequences to same length for batched forward pass
+            max_len = max(s.shape[1] for s in batch_seqs)
+            padded_ids = torch.zeros(len(batch_seqs), max_len, dtype=batch_seqs[0].dtype, device=student.device)
+            attn_mask = torch.zeros(len(batch_seqs), max_len, dtype=torch.long, device=student.device)
+            for j, seq in enumerate(batch_seqs):
+                seq_len = seq.shape[1]
+                padded_ids[j, :seq_len] = seq[0].to(student.device)
+                attn_mask[j, :seq_len] = 1
 
             with torch.no_grad():
-                s_logits = student(full_seq).logits.float()
-                cont_s = s_logits[:, prompt_len - 1:-1, :]
+                s_logits_batch = student(padded_ids, attention_mask=attn_mask).logits.float()
 
-            min_len = min(cont_s.shape[1], t_log_p.shape[1])
-            t_lp_slice = t_log_p[:, :min_len, :]
-            s_lp_slice = F.log_softmax(cont_s[:, :min_len, :], dim=-1)
+            # Compute per-sample KL
+            for j in range(len(batch_seqs)):
+                prompt_len = batch_prompt_lens[j]
+                seq_len = batch_seqs[j].shape[1]
 
-            kl_per_pos = F.kl_div(
-                s_lp_slice, t_lp_slice, log_target=True, reduction='none'
-            ).sum(dim=-1)
-            kl_mean = kl_per_pos.mean().item()
-            kl_scores.append(kl_mean)
+                t_logits = batch_teacher_logits[j].to(student.device).float()
+                t_log_p = F.log_softmax(t_logits, dim=-1)
 
-            del s_logits, cont_s, t_logits, t_log_p, t_lp_slice, s_lp_slice, kl_per_pos
+                cont_s = s_logits_batch[j:j+1, prompt_len - 1:seq_len - 1, :]
 
-            if (i + 1) % 5 == 0:
-                running_avg = sum(kl_scores) / len(kl_scores)
-                print(f"  Prompt {i + 1}/{len(eval_prompts)}: "
-                      f"KL={kl_mean:.6f} (running avg: {running_avg:.6f})", flush=True)
+                min_len = min(cont_s.shape[1], t_log_p.shape[1])
+                t_lp_slice = t_log_p[:, :min_len, :]
+                s_lp_slice = F.log_softmax(cont_s[:, :min_len, :], dim=-1)
+
+                kl_per_pos = F.kl_div(
+                    s_lp_slice, t_lp_slice, log_target=True, reduction='none'
+                ).sum(dim=-1)
+                kl_mean = kl_per_pos.mean().item()
+                kl_scores.append(kl_mean)
+
+                del t_logits, t_log_p, t_lp_slice, s_lp_slice, kl_per_pos
+
+                idx = batch_start + j + 1
+                if idx % 5 == 0:
+                    running_avg = sum(kl_scores) / len(kl_scores)
+                    print(f"  Prompt {idx}/{n_eval}: "
+                          f"KL={kl_mean:.6f} (running avg: {running_avg:.6f})", flush=True)
+
+            del s_logits_batch, padded_ids, attn_mask
 
         kl_global = sum(kl_scores) / len(kl_scores)
         import statistics
@@ -1005,21 +1029,38 @@ def main(
 
             king_kl_scores = []
             with torch.no_grad():
-                for i in range(len(eval_prompts)):
-                    full_seq = full_sequences[i]
-                    prompt_len = prompt_lens_list[i]
-                    t_logits = teacher_logits_list[i].to(king.device).float()
-                    t_log_p = F.log_softmax(t_logits, dim=-1)
-                    k_logits = king(full_seq).logits.float()
-                    cont_k = k_logits[:, prompt_len - 1:-1, :]
-                    min_len = min(cont_k.shape[1], t_log_p.shape[1])
-                    t_lp_slice = t_log_p[:, :min_len, :]
-                    k_lp_slice = F.log_softmax(cont_k[:, :min_len, :], dim=-1)
-                    kl_per_pos = F.kl_div(
-                        k_lp_slice, t_lp_slice, log_target=True, reduction='none'
-                    ).sum(dim=-1)
-                    king_kl_scores.append(kl_per_pos.mean().item())
-                    del t_logits, t_log_p, k_logits, cont_k, t_lp_slice, k_lp_slice, kl_per_pos
+                for batch_start in range(0, n_eval, EVAL_BATCH_SIZE):
+                    batch_end = min(batch_start + EVAL_BATCH_SIZE, n_eval)
+                    batch_seqs = full_sequences[batch_start:batch_end]
+                    batch_prompt_lens = prompt_lens_list[batch_start:batch_end]
+                    batch_teacher_logits = teacher_logits_list[batch_start:batch_end]
+
+                    max_len = max(s.shape[1] for s in batch_seqs)
+                    padded_ids = torch.zeros(len(batch_seqs), max_len, dtype=batch_seqs[0].dtype, device=king.device)
+                    attn_mask = torch.zeros(len(batch_seqs), max_len, dtype=torch.long, device=king.device)
+                    for j, seq in enumerate(batch_seqs):
+                        seq_len = seq.shape[1]
+                        padded_ids[j, :seq_len] = seq[0].to(king.device)
+                        attn_mask[j, :seq_len] = 1
+
+                    k_logits_batch = king(padded_ids, attention_mask=attn_mask).logits.float()
+
+                    for j in range(len(batch_seqs)):
+                        prompt_len = batch_prompt_lens[j]
+                        seq_len = batch_seqs[j].shape[1]
+                        t_logits = batch_teacher_logits[j].to(king.device).float()
+                        t_log_p = F.log_softmax(t_logits, dim=-1)
+                        cont_k = k_logits_batch[j:j+1, prompt_len - 1:seq_len - 1, :]
+                        min_len = min(cont_k.shape[1], t_log_p.shape[1])
+                        t_lp_slice = t_log_p[:, :min_len, :]
+                        k_lp_slice = F.log_softmax(cont_k[:, :min_len, :], dim=-1)
+                        kl_per_pos = F.kl_div(
+                            k_lp_slice, t_lp_slice, log_target=True, reduction='none'
+                        ).sum(dim=-1)
+                        king_kl_scores.append(kl_per_pos.mean().item())
+                        del t_logits, t_log_p, t_lp_slice, k_lp_slice, kl_per_pos
+
+                    del k_logits_batch, padded_ids, attn_mask
 
             king_kl = sum(king_kl_scores) / len(king_kl_scores)
 
