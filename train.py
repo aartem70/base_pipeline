@@ -40,8 +40,8 @@ Prompt sampling:
 Hyperparameters:
     --lr              Learning rate (default: 1e-4)
     --warmup_steps    LR warmup steps (default: 10)
-    --max_seq_len     Max sequence length (default: 640)
-    --kl_start_pos    Compute KL from this position onward (default: 128)
+    --max_seq_len     Max sequence length (default: 2048)
+    --kl_start_pos    Compute KL from this position onward (default: 0)
     --batch_size      Micro-batch size for forward passes (default: 4)
     --topk_distil     Transfer only top-K logits across GPUs (0 = full vocab, default: 0)
 
@@ -98,11 +98,12 @@ LR = 1e-4
 WARMUP = 10
 WEIGHT_DECAY = 0.0
 GRAD_CLIP = 1.0
-MAX_SEQ_LEN = 640
-KL_START_POS = 128
+MAX_SEQ_LEN = 2048
+KL_START_POS = 0
 PROMPTS_PER_STEP = 60
 SAVE_EVERY = 500
 BATCH_SIZE = 4
+PLOT_EVERY = 10
 
 # Hugging Face repo to copy preprocessor_config.json from (matches evaluate.py hint).
 _PREPROCESSOR_TEMPLATE_REPO = "Qwen/Qwen3.5-4B"
@@ -190,6 +191,8 @@ class RandomPromptSampler:
         self._current_indices = []
         self._index_pos = 0
         self._total_sampled = 0
+        self._climbmix_sampled = 0
+        self._fineweb_sampled = 0
 
     def _load_shard(self):
         from datasets import load_dataset
@@ -273,15 +276,31 @@ class RandomPromptSampler:
             if len(texts) < n:
                 self._current_shard = None
 
+        n_from_climbmix = len(texts)
         if len(texts) < n:
-            texts.extend(self._load_fineweb_fallback(n - len(texts)))
+            fallback_texts = self._load_fineweb_fallback(n - len(texts))
+            texts.extend(fallback_texts)
+            self._fineweb_sampled += len(fallback_texts)
+            log.warning(
+                "FineWeb fallback used: %d/%d prompts from FineWeb (total FineWeb: %d)",
+                len(fallback_texts), n, self._fineweb_sampled,
+            )
 
+        self._climbmix_sampled += n_from_climbmix
         self._total_sampled += len(texts)
         return texts
 
     @property
     def total_sampled(self):
         return self._total_sampled
+
+    @property
+    def data_source_stats(self):
+        return {
+            "climbmix": self._climbmix_sampled,
+            "fineweb": self._fineweb_sampled,
+            "total": self._total_sampled,
+        }
 
 
 # -- Batched KL loss with padding mask -----------------------------------------
@@ -448,7 +467,7 @@ def main():
                         help="Disable wandb logging")
     parser.add_argument("--no_train_plots", action="store_true",
                         help="Do not write train_metrics.csv or train_curves.png")
-    parser.add_argument("--plot_every", type=int, default=0,
+    parser.add_argument("--plot_every", type=int, default=PLOT_EVERY,
                         help="Rewrite train_curves.png every N steps (0 = only at training end)")
 
     args = parser.parse_args()
@@ -768,6 +787,13 @@ def main():
         )
     else:
         log.info("Training complete at step %d.", global_step)
+
+    stats = sampler.data_source_stats
+    log.info(
+        "Data source breakdown: ClimbMix=%d, FineWeb=%d (%.1f%% ClimbMix)",
+        stats["climbmix"], stats["fineweb"],
+        100 * stats["climbmix"] / max(stats["total"], 1),
+    )
 
     if not args.no_wandb:
         import wandb
