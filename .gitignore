@@ -46,6 +46,9 @@ htmlcov/
 # Training checkpoints
 distil-checkpoints/
 
+# Weights & Biases (local run data)
+wandb/
+
 # OS
 .DS_Store
 Thumbs.db
