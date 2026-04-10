@@ -300,22 +300,22 @@ class VLLMTeacher:
     due to PagedAttention, continuous batching, and optimized CUDA kernels.
     """
 
-    def __init__(self, model_name, gpu_id=0, gpu_memory_utilization=0.90, topk=512):
+    def __init__(self, model_name, gpu_id=0, gpu_memory_utilization=0.90, topk=512, max_model_len=4096):
         from vllm import LLM
 
         self.topk = topk
         self.model_name = model_name
         log.info(f"Loading teacher via vLLM ({model_name}) on GPU {gpu_id}...")
-        log.info(f"  gpu_memory_utilization={gpu_memory_utilization}, prompt_logprobs top-k={topk}")
+        log.info(f"  gpu_memory_utilization={gpu_memory_utilization}, prompt_logprobs top-k={topk}, max_model_len={max_model_len}")
 
-        # vLLM uses CUDA_VISIBLE_DEVICES or tensor_parallel for GPU placement
         self.llm = LLM(
             model=model_name,
             dtype="bfloat16",
             gpu_memory_utilization=gpu_memory_utilization,
             tensor_parallel_size=1,
             trust_remote_code=True,
-            enforce_eager=True,  # avoid CUDA graph overhead for variable-length prompts
+            enforce_eager=True,
+            max_model_len=max_model_len,
         )
         log.info("  vLLM teacher loaded.")
 
@@ -579,6 +579,7 @@ def main():
             gpu_id=args.teacher_gpu,
             gpu_memory_utilization=args.vllm_gpu_util,
             topk=args.topk_distil,
+            max_model_len=args.max_seq_len + 128,  # slight headroom over training seq len
         )
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         teacher = None
