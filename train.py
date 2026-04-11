@@ -274,6 +274,37 @@ def batched_kl_loss(student_logits, teacher_logits, attention_mask, start_pos=KL
     return kl_per_pos.sum() / n_valid
 
 
+def batched_ce_loss(student_logits, input_ids, attention_mask, start_pos=KL_START_POS):
+    """Cross-entropy loss on ground-truth tokens (hard labels), with padding mask.
+
+    The target at position t is the token at position t+1 (next-token prediction).
+
+    Args:
+        student_logits: [B, L, V] student model logits
+        input_ids: [B, L] ground-truth token ids
+        attention_mask: [B, L] binary mask (1 = real token, 0 = padding)
+        start_pos: skip first N positions
+    """
+    # Shift: logits[t] predicts token[t+1]
+    s = student_logits[:, start_pos:-1, :].contiguous()  # [B, L-start_pos-1, V]
+    targets = input_ids[:, start_pos + 1:].contiguous()   # [B, L-start_pos-1]
+    mask = attention_mask[:, start_pos + 1:].float()       # [B, L-start_pos-1]
+
+    # Flatten for cross_entropy
+    B, L, V = s.shape
+    ce_per_pos = F.cross_entropy(
+        s.view(B * L, V),
+        targets.view(B * L),
+        reduction='none',
+    ).view(B, L)  # [B, L]
+
+    ce_per_pos = ce_per_pos * mask
+    n_valid = mask.sum()
+    if n_valid == 0:
+        return torch.tensor(0.0, device=s.device, requires_grad=True)
+    return ce_per_pos.sum() / n_valid
+
+
 def topk_compress(logits, k):
     """Compress logits to top-k values and indices for bandwidth-efficient transfer.
 
@@ -460,6 +491,9 @@ def main():
                         help="Stop after N steps (0 = run forever)")
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE,
                         help="Micro-batch size for forward passes (adjust based on GPU memory)")
+    parser.add_argument("--ce_weight", type=float, default=0.0,
+                        help="Weight for hard-label cross-entropy loss mixed with KL. "
+                             "Total loss = KL + ce_weight * CE. Try 0.5 or 1.0. (0 = KL only)")
     parser.add_argument("--topk_distil", type=int, default=0,
                         help="Transfer only top-K logits between GPUs (0 = full vocab). "
                              "Reduces cross-GPU bandwidth. Try 512 or 1024.")
@@ -680,6 +714,8 @@ def main():
     log.info(f"  LR: {args.lr}, Warmup: {args.warmup_steps}, Prompts/step: {args.prompts_per_step}")
     log.info(f"  Seq len: {args.max_seq_len}, KL from pos {args.kl_start_pos}")
     log.info(f"  Batch size: {args.batch_size}")
+    if args.ce_weight > 0:
+        log.info(f"  Mixed loss: KL + {args.ce_weight} * CE (hard-label cross-entropy)")
     log.info(f"  Seed: {args.seed}, Resample every: {args.resample_every} step(s)")
     if args.topk_distil > 0:
         log.info(f"  Top-k distillation: k={args.topk_distil} (transferring {args.topk_distil}/{vocab_size} logits)")
@@ -764,12 +800,21 @@ def main():
             s_logits = s_out.logits
             del s_out
 
-            # Masked KL loss
-            loss = batched_kl_loss(
+            # Masked KL loss + optional CE loss
+            kl = batched_kl_loss(
                 s_logits, t_logits,
                 mb_mask.to(sdev),
                 start_pos=args.kl_start_pos,
             )
+            if args.ce_weight > 0:
+                ce = batched_ce_loss(
+                    s_logits, mb_ids.to(sdev),
+                    mb_mask.to(sdev),
+                    start_pos=args.kl_start_pos,
+                )
+                loss = kl + args.ce_weight * ce
+            else:
+                loss = kl
 
             # Scale loss by number of micro-batches for gradient accumulation
             n_total_batches = math.ceil(n_samples / args.batch_size)
