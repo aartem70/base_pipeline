@@ -835,6 +835,16 @@ def main(
 
             print(f"  Teacher logits generated for {len(eval_prompts)} prompts")
 
+            # Save teacher cache for future evals
+            if teacher_cache:
+                print(f"  Saving teacher cache to {teacher_cache}...")
+                torch.save({
+                    "full_sequences": full_sequences,
+                    "teacher_logits": teacher_logits_list,
+                    "prompt_lens": prompt_lens_list,
+                }, teacher_cache)
+                print(f"  Teacher cache saved ({len(full_sequences)} prompts)")
+
             del teacher
             torch.cuda.empty_cache()
 
