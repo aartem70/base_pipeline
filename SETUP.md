@@ -30,7 +30,7 @@ sudo apt-get update
 sudo apt-get install -y cuda-toolkit-12-6
 
 # Install C++ build tools
-sudo apt-get install -y build-essential g++-11 wheel
+sudo apt-get install -y build-essential g++-11
 
 # Set environment variables
 export CUDA_HOME=/usr/local/cuda-12.6
@@ -53,10 +53,13 @@ that has no pre-built wheels for CUDA extensions. Downgrade to a stable version 
 # 1. Downgrade PyTorch to stable CUDA 12.6 build
 pip install torch==2.6.0+cu126 --index-url https://download.pytorch.org/whl/cu126
 
-# 2. Install base dependencies
+# 2. Install wheel (needed for building CUDA extensions)
+pip install wheel
+
+# 3. Install base dependencies
 pip install -r requirements.txt
 
-# 3. Install CUDA extensions (builds against torch 2.6)
+# 4. Install CUDA extensions (builds against torch 2.6)
 pip install flash-attn --no-build-isolation --no-cache-dir
 pip install causal-conv1d --no-build-isolation --no-cache-dir
 ```
