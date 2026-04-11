@@ -40,7 +40,7 @@ Prompt sampling:
 Hyperparameters:
     --lr              Learning rate (default: 1e-4)
     --warmup_steps    LR warmup steps (default: 10)
-    --max_seq_len     Max sequence length (default: 2048)
+    --max_seq_len     Max sequence length (default: 1024)
     --kl_start_pos    Compute KL from this position onward (default: 0)
     --batch_size      Micro-batch size for forward passes (default: 4)
     --topk_distil     Transfer only top-K logits across GPUs (0 = full vocab, default: 0)
@@ -97,7 +97,7 @@ LR = 1e-4
 WARMUP = 10
 WEIGHT_DECAY = 0.0
 GRAD_CLIP = 1.0
-MAX_SEQ_LEN = 2048
+MAX_SEQ_LEN = 1024
 KL_START_POS = 0
 PROMPTS_PER_STEP = 60
 SAVE_EVERY = 500
