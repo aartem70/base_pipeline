@@ -494,6 +494,16 @@ def main():
     parser.add_argument("--ce_weight", type=float, default=0.0,
                         help="Weight for hard-label cross-entropy loss mixed with KL. "
                              "Total loss = KL + ce_weight * CE. Try 0.5 or 1.0. (0 = KL only)")
+
+    # Continuation mode (matches eval protocol)
+    parser.add_argument("--continuation", action="store_true",
+                        help="Train on teacher-generated continuations (matches eval protocol). "
+                             "Teacher generates from prompt, KL computed only on continuation.")
+    parser.add_argument("--prompt_len", type=int, default=128,
+                        help="Number of tokens to use as prompt in continuation mode")
+    parser.add_argument("--max_new_tokens", type=int, default=512,
+                        help="Max tokens teacher generates in continuation mode")
+
     parser.add_argument("--topk_distil", type=int, default=0,
                         help="Transfer only top-K logits between GPUs (0 = full vocab). "
                              "Reduces cross-GPU bandwidth. Try 512 or 1024.")
@@ -716,6 +726,8 @@ def main():
     log.info(f"  Batch size: {args.batch_size}")
     if args.ce_weight > 0:
         log.info(f"  Mixed loss: KL + {args.ce_weight} * CE (hard-label cross-entropy)")
+    if args.continuation:
+        log.info(f"  Continuation mode: prompt_len={args.prompt_len}, max_new_tokens={args.max_new_tokens}")
     log.info(f"  Seed: {args.seed}, Resample every: {args.resample_every} step(s)")
     if args.topk_distil > 0:
         log.info(f"  Top-k distillation: k={args.topk_distil} (transferring {args.topk_distil}/{vocab_size} logits)")
@@ -747,9 +759,10 @@ def main():
         input_ids = batch_enc["input_ids"]          # [N, L]
         attention_mask = batch_enc["attention_mask"]  # [N, L]
 
-        # Filter: keep only sequences long enough for KL
+        # Filter: keep only sequences long enough
+        min_len = args.prompt_len + 10 if args.continuation else args.kl_start_pos + 10
         seq_lens = attention_mask.sum(dim=1)
-        keep = seq_lens > args.kl_start_pos + 10
+        keep = seq_lens > min_len
         input_ids = input_ids[keep]
         attention_mask = attention_mask[keep]
 
@@ -758,15 +771,66 @@ def main():
             cached_texts = None
             continue
 
-        n_samples = input_ids.shape[0]
+        # ── Continuation mode: teacher generates continuations ────────────
+        if args.continuation:
+            cont_sequences = []
+            cont_prompt_lens = []
+
+            with torch.no_grad():
+                for j in range(input_ids.shape[0]):
+                    seq_len = attention_mask[j].sum().item()
+                    prompt_ids = input_ids[j, :min(args.prompt_len, seq_len)].unsqueeze(0).to(tdev)
+
+                    output = teacher.generate(
+                        prompt_ids,
+                        max_new_tokens=args.max_new_tokens,
+                        do_sample=False,
+                        temperature=1.0,
+                    )
+                    full_seq = output[0]  # [total_len]
+                    prompt_len = prompt_ids.shape[1]
+
+                    # Skip if teacher generated too few tokens
+                    if full_seq.shape[0] - prompt_len < 10:
+                        continue
+
+                    cont_sequences.append(full_seq.cpu())
+                    cont_prompt_lens.append(prompt_len)
+
+            if len(cont_sequences) == 0:
+                log.warning(f"Step {global_step}: no valid continuations, resampling...")
+                cached_texts = None
+                continue
+
+            n_samples = len(cont_sequences)
+        # ── Standard mode: use raw text ───────────────────────────────────
+        else:
+            cont_sequences = None
+            n_samples = input_ids.shape[0]
+
         optimizer.zero_grad()
         total_loss = 0.0
         n_batches = 0
 
         # ── Micro-batched forward passes ──────────────────────────────────
         for i in range(0, n_samples, args.batch_size):
-            mb_ids = input_ids[i:i + args.batch_size]
-            mb_mask = attention_mask[i:i + args.batch_size]
+
+            if args.continuation:
+                # Pad continuation sequences into a batch
+                batch_seqs = cont_sequences[i:i + args.batch_size]
+                batch_plens = cont_prompt_lens[i:i + args.batch_size]
+                max_len = max(s.shape[0] for s in batch_seqs)
+                mb_ids = torch.zeros(len(batch_seqs), max_len, dtype=batch_seqs[0].dtype)
+                mb_mask = torch.zeros(len(batch_seqs), max_len, dtype=torch.long)
+                for j, seq in enumerate(batch_seqs):
+                    mb_ids[j, :seq.shape[0]] = seq
+                    mb_mask[j, :seq.shape[0]] = 1
+                # KL start position = prompt length (skip prompt, score continuation only)
+                kl_start = min(batch_plens)
+            else:
+                mb_ids = input_ids[i:i + args.batch_size]
+                mb_mask = attention_mask[i:i + args.batch_size]
+                kl_start = args.kl_start_pos
 
             # Teacher forward (no grad)
             with torch.no_grad():
@@ -800,17 +864,17 @@ def main():
             s_logits = s_out.logits
             del s_out
 
-            # Masked KL loss + optional CE loss
+            # Masked KL loss + optional CE loss (continuation-only in continuation mode)
             kl = batched_kl_loss(
                 s_logits, t_logits,
                 mb_mask.to(sdev),
-                start_pos=args.kl_start_pos,
+                start_pos=kl_start,
             )
             if args.ce_weight > 0:
                 ce = batched_ce_loss(
                     s_logits, mb_ids.to(sdev),
                     mb_mask.to(sdev),
-                    start_pos=args.kl_start_pos,
+                    start_pos=kl_start,
                 )
                 loss = kl + args.ce_weight * ce
             else:
