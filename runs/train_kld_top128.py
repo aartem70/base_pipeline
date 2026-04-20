@@ -1,18 +1,14 @@
 """
-Full-parameter forward-KL distillation on cached teacher logits.
+Norm/bias-only top-K renormalized KL distillation on cached teacher logits.
 
-Combines two findings:
-1. Norm/bias-only FT preserves the distil sharp-minimum basin (Exp 8.2 showed
-   500 steps at LR=1e-5 kept eval KL at baseline within noise).
-2. Forward KL uses the full teacher distribution (richer gradient signal than
-   CE, which only pushes toward sampled tokens).
+Matches the validator's loss exactly:
+  - Teacher: softmax over its own top-K logits at each position.
+  - Student: full-vocab log_softmax, gather at teacher's top-K indices,
+    then renormalize over the same K support.
+  - KL is computed between two K-support distributions, not full vocab.
 
-Cache format (same as cont_cache_600.pt):
-    sequences      list[LongTensor[L]]
-    prompt_lens    list[int]
-    teacher_logits list[BF16Tensor[L, V]]
-
-We memory-map the cache so teacher_logits doesn't OOM the host.
+Only norm/bias parameters are trained; training runs in fp32 (required for
+large-magnitude norm weights where bf16 Adam steps round to zero).
 """
 import argparse
 import gc
@@ -58,6 +54,8 @@ def pad_batch(seqs, pad_id=0):
 def save_ckpt(student, tokenizer, args, step, name, extra=None):
     d = os.path.join(args.output_dir, name)
     os.makedirs(d, exist_ok=True)
+    # Save at the model's current dtype (no cast). If training ran in fp32,
+    # the saved file preserves fp32 precision; bf16 training saves bf16.
     student.save_pretrained(d, safe_serialization=True)
     tokenizer.save_pretrained(d)
     state = {"global_step": step, "name": name, "seed": args.seed}
@@ -85,10 +83,10 @@ def main():
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--grad_clip", type=float, default=1.0)
-    ap.add_argument("--kl_continuation_only",
-                    action=argparse.BooleanOptionalAction, default=True,
-                    help="mask KL to continuation positions (skip prompt). "
-                         "Use --no-kl_continuation_only to include prompt positions.")
+    ap.add_argument("--kl_continuation_only", action="store_true", default=True,
+                    help="mask KL to continuation positions (skip prompt)")
+    ap.add_argument("--topk", type=int, default=128,
+                    help="Top-K support for renormalized KL (validator uses 128).")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -114,12 +112,19 @@ def main():
         args.student,
         dtype=dtype,
         trust_remote_code=True,
-    ).to(args.device)
+    ).to(args.device).to(dtype)  # force dtype even if config says otherwise
+    print(f"  actual loaded dtype: {next(student.parameters()).dtype}", flush=True)
 
     n_total = sum(p.numel() for p in student.parameters())
-    n_trainable = n_total  # full-parameter training
-    print(f"  total params = {n_total/1e9:.3f}B; trainable = {n_trainable/1e9:.3f}B "
-          f"(100%)", flush=True)
+    n_trainable = 0
+    for name, p in student.named_parameters():
+        if is_norm_or_bias(name, p):
+            p.requires_grad_(True)
+            n_trainable += p.numel()
+        else:
+            p.requires_grad_(False)
+    print(f"  total params = {n_total/1e9:.3f}B; trainable = {n_trainable/1e6:.2f}M "
+          f"({n_trainable/n_total*100:.2f}%)", flush=True)
 
     student.train()
     try:
@@ -203,9 +208,16 @@ def main():
                 continue
             t_slice = t[start:end]  # [k, V]
             s_slice = s[start:end]  # [k, V]
-            t_lp = F.log_softmax(t_slice, dim=-1)
-            s_lp = F.log_softmax(s_slice, dim=-1)
-            kl = F.kl_div(s_lp, t_lp, log_target=True, reduction="none").sum(dim=-1).sum()
+            # Validator-style sparse top-K KL:
+            # Teacher = softmax over its own top-K logits.
+            # Student = full-vocab log_softmax, gather at teacher top-K indices,
+            # then renormalize over the same K support.
+            t_topk_vals, t_topk_idx = t_slice.topk(args.topk, dim=-1)
+            t_lp_k = F.log_softmax(t_topk_vals, dim=-1)
+            s_lp_full = F.log_softmax(s_slice, dim=-1)
+            s_lp_k = s_lp_full.gather(-1, t_topk_idx)
+            s_lp_k = s_lp_k - s_lp_k.logsumexp(-1, keepdim=True)
+            kl = F.kl_div(s_lp_k, t_lp_k, log_target=True, reduction="none").sum(dim=-1).sum()
             total_kl = total_kl + kl
             total_tokens += (end - start)
 

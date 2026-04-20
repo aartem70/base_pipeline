@@ -58,6 +58,8 @@ def pad_batch(seqs, pad_id=0):
 def save_ckpt(student, tokenizer, args, step, name, extra=None):
     d = os.path.join(args.output_dir, name)
     os.makedirs(d, exist_ok=True)
+    # Save at the model's current dtype (no cast). If training ran in fp32,
+    # the saved file preserves fp32 precision; bf16 training saves bf16.
     student.save_pretrained(d, safe_serialization=True)
     tokenizer.save_pretrained(d)
     state = {"global_step": step, "name": name, "seed": args.seed}
@@ -112,7 +114,8 @@ def main():
         args.student,
         dtype=dtype,
         trust_remote_code=True,
-    ).to(args.device)
+    ).to(args.device).to(dtype)  # force dtype even if config says otherwise
+    print(f"  actual loaded dtype: {next(student.parameters()).dtype}", flush=True)
 
     n_total = sum(p.numel() for p in student.parameters())
     n_trainable = 0
