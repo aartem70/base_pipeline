@@ -1,25 +1,41 @@
 """
-Build a teacher_cache_60-style eval cache for a given climbmix seed/shard.
+Build a prod-validator-matching teacher cache at seed S with N prompts.
 
-Mirrors evaluate.py's cache-building path exactly (VALIDATOR_MAX_NEW_TOKENS=512,
-greedy, full-vocab continuation logits).
+Matches exactly what unarbos/distil/scripts/pod_eval_vllm.py stores as the
+sparse "teacher_logits_list" entry:
+
+    - full_ids        : [1, prompt_len + gen_len] token ids
+    - prompt_len      : int
+    - gen_len         : int
+    - teacher_topk_indices : [1, gen_len, K]  dtype=int64
+    - teacher_topk_logprobs: [1, gen_len, K]  dtype=float32   (log-probs, negative)
+
+K defaults to 128 (prod default; --logprobs-k 128 in pod_eval_vllm.py).
+
+Generation config matches prod greedy path (block_seed is None):
+    temperature=0.0, top_p=1.0, do_sample=False, max_new_tokens=512
+
+Cache file is ~20 MB for N=60 (vs 16 GB for full-vocab cache).
 
 Usage:
-    python runs/build_eval_cache.py --seed 7 --n 60 \
-        --output /ephemeral/teacher_cache_60_seed7.pt
+    python runs/build_eval_cache.py --seed 42 --n 60 \
+        --output /root/base_pipeline/caches/teacher_cache_60_top128.pt
 """
+
 import argparse
 import os
 import random
 import time
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
 CLIMBMIX_DATASET = "karpathy/climbmix-400b-shuffle"
 CLIMBMIX_NUM_SHARDS = 6542
 VALIDATOR_MAX_NEW_TOKENS = 512
+LOGPROBS_K = 128  # prod default: pod_eval_vllm.py --logprobs-k 128
 
 
 def sample_random_prompts(n, seed, min_chars=500, max_chars=10000):
@@ -54,6 +70,8 @@ def main():
     ap.add_argument("--n", type=int, default=60)
     ap.add_argument("--output", required=True)
     ap.add_argument("--max_new_tokens", type=int, default=VALIDATOR_MAX_NEW_TOKENS)
+    ap.add_argument("--logprobs_k", type=int, default=LOGPROBS_K,
+                    help="Top-K log-probs to store per generated position (default 128, matches prod).")
     args = ap.parse_args()
 
     prompts, shard_idx = sample_random_prompts(args.n, args.seed)
@@ -78,38 +96,67 @@ def main():
     print(f"  loaded in {time.time()-t0:.1f}s  VRAM={torch.cuda.memory_allocated()/1e9:.1f}GB",
           flush=True)
 
-    full_sequences, teacher_logits_list, prompt_lens = [], [], []
+    cache_entries = []
     t0 = time.time()
     with torch.no_grad():
         for i, text in enumerate(prompts):
             ids = tok(text, return_tensors="pt", truncation=False).input_ids.to(teacher.device)
             plen = ids.shape[1]
+
+            # prod path: greedy generation when block_seed is None
             out_ids = teacher.generate(
-                ids, max_new_tokens=args.max_new_tokens,
-                do_sample=False, use_cache=True,
+                ids,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=False,          # greedy (temperature=0, top_p=1)
+                use_cache=True,
             )
             gen_len = out_ids.shape[1] - plen
+            if gen_len == 0:
+                cache_entries.append({
+                    "full_ids": out_ids.cpu(),
+                    "prompt_len": int(plen),
+                    "gen_len": 0,
+                    "teacher_topk_indices": None,
+                    "teacher_topk_logprobs": None,
+                })
+                print(f"  [{i+1}/{len(prompts)}] plen={plen} gen=0  (skipped by min_completion filter at eval)",
+                      flush=True)
+                continue
+
+            # forward pass on full sequence, take continuation slice only
             logits = teacher(out_ids).logits.float()
-            cont = logits[:, plen - 1:-1, :].cpu()
-            full_sequences.append(out_ids.cpu())
-            teacher_logits_list.append(cont)
-            prompt_lens.append(plen)
-            del logits, cont
-            print(f"  [{i+1}/{len(prompts)}] plen={plen} gen={gen_len}  "
-                  f"elapsed={time.time()-t0:.0f}s", flush=True)
+            # logits[p] predicts token p+1, so continuation logits live at
+            # positions [plen-1 : -1]  (length = gen_len)
+            cont_logits = logits[:, plen - 1:-1, :]   # [1, gen_len, V]
+
+            # full-vocab log_softmax, then top-K
+            cont_logp = F.log_softmax(cont_logits, dim=-1)
+            topk_vals, topk_idx = cont_logp.topk(args.logprobs_k, dim=-1)   # [1, gen_len, K]
+
+            cache_entries.append({
+                "full_ids": out_ids.cpu(),
+                "prompt_len": int(plen),
+                "gen_len": int(gen_len),
+                "teacher_topk_indices": topk_idx.cpu(),               # int64
+                "teacher_topk_logprobs": topk_vals.cpu(),             # float32, log-probs (negative)
+            })
+            del logits, cont_logits, cont_logp, topk_vals, topk_idx
+            print(f"  [{i+1}/{len(prompts)}] plen={plen} gen={gen_len}  elapsed={time.time()-t0:.0f}s",
+                  flush=True)
 
     print(f"[save] {args.output}", flush=True)
     tmp = args.output + ".tmp"
     torch.save({
-        "full_sequences": full_sequences,
-        "teacher_logits": teacher_logits_list,
-        "prompt_lens": prompt_lens,
+        "entries": cache_entries,
         "shard_idx": shard_idx,
         "seed": args.seed,
+        "logprobs_k": args.logprobs_k,
+        "max_new_tokens": args.max_new_tokens,
+        "teacher_model": TEACHER_MODEL,
     }, tmp)
     os.replace(tmp, args.output)
-    print(f"[done] {len(full_sequences)} prompts, shard {shard_idx}, "
-          f"total {time.time()-t0:.0f}s", flush=True)
+    print(f"[done] {len(cache_entries)} prompts, shard {shard_idx}, K={args.logprobs_k}, "
+          f"total {time.time()-t0:.0f}s, file={os.path.getsize(args.output)/1e6:.1f} MB", flush=True)
 
 
 if __name__ == "__main__":

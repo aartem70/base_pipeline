@@ -25,6 +25,7 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import gc
 import json
 import logging
@@ -109,14 +110,19 @@ def sglang_health_check(base_url):
         return False
 
 
-def sglang_generate(base_url, prompt_tokens, max_new_tokens, tokenizer):
+def sglang_generate(base_url, prompt_tokens, max_new_tokens, tokenizer,
+                    temperature=0.0, top_p=1.0, seed=None):
     """Generate continuation using SGLang server. Returns list of generated token IDs."""
+    sampling_params = {
+        "max_new_tokens": max_new_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+    }
+    # Note: SGLang 0.5.10 doesn't support seed in sampling_params. Diversity
+    # still comes from server-internal randomness per request.
     payload = {
         "input_ids": prompt_tokens,
-        "sampling_params": {
-            "max_new_tokens": max_new_tokens,
-            "temperature": 0.0,  # greedy, same as do_sample=False
-        },
+        "sampling_params": sampling_params,
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -213,39 +219,44 @@ def generate_continuations(args, tokenizer):
         if not batch_prompt_tokens:
             continue
 
-        # Generate via SGLang (one at a time for reliability)
-        for i, (prompt_tokens, prompt_tensor) in enumerate(
-            zip(batch_prompt_tokens, batch_prompt_tensors)
-        ):
-            if n_generated >= args.n:
-                break
+        # Concurrent SGLang requests — SGLang does continuous batching server-side.
+        concurrency = max(1, args.concurrency)
+        def _one(prompt_tokens):
             try:
-                gen_ids = sglang_generate(base_url, prompt_tokens, args.max_new_tokens, tokenizer)
-            except Exception as e:
-                log.warning(f"  SGLang generation failed: {e}, skipping...")
-                n_skipped += 1
-                continue
-
-            if len(gen_ids) < 10:
-                n_skipped += 1
-                continue
-
-            # Build full sequence: prompt + generated
-            gen_tensor = torch.tensor(gen_ids, dtype=prompt_tensor.dtype)
-            full_seq = torch.cat([prompt_tensor, gen_tensor])
-            prompt_len = prompt_tensor.shape[0]
-
-            results.append((prompt_len, full_seq))
-            n_generated += 1
-
-            if n_generated % 50 == 0 or n_generated == args.n:
-                elapsed = time.time() - t_start
-                rate = n_generated / elapsed
-                eta = (args.n - n_generated) / rate if rate > 0 else 0
-                log.info(
-                    f"  Generated {n_generated}/{args.n} "
-                    f"({rate:.1f}/s, ETA {eta / 60:.0f}min, skipped {n_skipped})"
+                gen_ids = sglang_generate(
+                    base_url, prompt_tokens, args.max_new_tokens, tokenizer,
+                    temperature=args.temperature, top_p=args.top_p, seed=None,
                 )
+                return gen_ids
+            except Exception as e:
+                return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
+            futures = {
+                ex.submit(_one, pt): pt_tensor
+                for pt, pt_tensor in zip(batch_prompt_tokens, batch_prompt_tensors)
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                if n_generated >= args.n:
+                    break
+                prompt_tensor = futures[fut]
+                gen_ids = fut.result()
+                if gen_ids is None or len(gen_ids) < 10:
+                    n_skipped += 1
+                    continue
+                gen_tensor = torch.tensor(gen_ids, dtype=prompt_tensor.dtype)
+                full_seq = torch.cat([prompt_tensor, gen_tensor])
+                prompt_len = prompt_tensor.shape[0]
+                results.append((prompt_len, full_seq))
+                n_generated += 1
+                if n_generated % 25 == 0 or n_generated == args.n:
+                    elapsed = time.time() - t_start
+                    rate = n_generated / elapsed if elapsed > 0 else 0
+                    eta = (args.n - n_generated) / rate if rate > 0 else 0
+                    log.info(
+                        f"  Generated {n_generated}/{args.n} "
+                        f"({rate:.2f}/s, ETA {eta / 60:.1f}min, skipped {n_skipped})"
+                    )
 
     elapsed = time.time() - t_start
     log.info(f"Phase 1 done: {n_generated} continuations in {elapsed / 60:.1f}min")
@@ -354,6 +365,15 @@ def main():
     parser.add_argument("--gen_batch", type=int, default=20, help="Prompts to sample per batch")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--save_every", type=int, default=500, help="Save checkpoint every N samples")
+    parser.add_argument("--concurrency", type=int, default=1,
+                        help="Concurrent SGLang requests in flight")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0.0 = greedy)")
+    parser.add_argument("--top_p", type=float, default=1.0, help="Nucleus sampling top_p")
+    parser.add_argument("--gen_seed", type=int, default=None,
+                        help="Per-prompt generation seed base (seed=gen_seed+idx). None = unseeded")
+    parser.add_argument("--eval_format", action="store_true",
+                        help="Save cache in eval_bootstrap_region.py format: "
+                             "full_sequences (B=1 batch dim), teacher_logits_full")
     args = parser.parse_args()
 
     log.info("=" * 60)
@@ -416,6 +436,12 @@ def main():
     log.info("=" * 60)
     log.info("Phase 3: Saving cache")
     log.info("=" * 60)
+    if args.eval_format:
+        cache_data = {
+            "full_sequences": [s.unsqueeze(0) for s in cache_data["sequences"]],
+            "prompt_lens": cache_data["prompt_lens"],
+            "teacher_logits_full": cache_data["teacher_logits"],
+        }
     save_cache(cache_data, args.output)
 
     # Cleanup checkpoint

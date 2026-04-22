@@ -165,7 +165,23 @@ def save_student_checkpoint(
 ) -> str:
     d = os.path.join(args.output_dir, dest_name)
     os.makedirs(d, exist_ok=True)
-    student.save_pretrained(d, safe_serialization=True)
+
+    # If student is a PEFT-wrapped model, save a merged full model so that
+    # evaluate.py can load it with AutoModelForCausalLM. We deepcopy to CPU
+    # and merge there; the in-memory PEFT wrapper stays intact for training.
+    try:
+        from peft import PeftModel
+        is_peft = isinstance(student, PeftModel)
+    except Exception:
+        is_peft = False
+    if is_peft:
+        import copy
+        log.info(f"  [LoRA] merging adapters and saving full model to {d}")
+        merged = copy.deepcopy(student).to("cpu").merge_and_unload()
+        merged.save_pretrained(d, safe_serialization=True)
+        del merged
+    else:
+        student.save_pretrained(d, safe_serialization=True)
     tokenizer.save_pretrained(d)
     finalize_checkpoint_for_submission(d)
     torch.save(optimizer.state_dict(), os.path.join(d, "optimizer.pt"))
@@ -177,6 +193,59 @@ def save_student_checkpoint(
         }, f, indent=2)
     log.info(f"  Saved checkpoint: {d}")
     return d
+
+
+class JSONLPromptSampler:
+    """Samples prompts from a local JSONL file. Each line must be a JSON object
+    with a 'text' field. Shuffles once on load, then streams in order."""
+
+    def __init__(self, path, seed=42, min_chars=2560, max_chars=10000):
+        self._path = path
+        self._rng = random.Random(seed)
+        self._min_chars = min_chars
+        self._max_chars = max_chars
+        self._texts = None
+        self._pos = 0
+        self._total_sampled = 0
+        self._load()
+
+    def _load(self):
+        texts = []
+        with open(self._path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                t = obj.get("text", "")
+                if not t or len(t) < self._min_chars:
+                    continue
+                if len(t) > self._max_chars:
+                    t = t[:self._max_chars]
+                    ls = t.rfind(" ")
+                    if ls > self._max_chars // 2:
+                        t = t[:ls]
+                texts.append(t)
+        self._rng.shuffle(texts)
+        self._texts = texts
+        self._pos = 0
+        log.info(f"Loaded {len(texts)} prompts from {self._path}")
+
+    def sample(self, n):
+        out = []
+        while len(out) < n:
+            if self._pos >= len(self._texts):
+                # reshuffle and wrap
+                self._rng.shuffle(self._texts)
+                self._pos = 0
+            out.append(self._texts[self._pos])
+            self._pos += 1
+        self._total_sampled += len(out)
+        return out
+
+    @property
+    def total_sampled(self):
+        return self._total_sampled
 
 
 class RandomPromptSampler:
@@ -244,30 +313,54 @@ class RandomPromptSampler:
 
 # -- Batched KL loss with padding mask -----------------------------------------
 
-def batched_kl_loss(student_logits, teacher_logits, attention_mask, start_pos=KL_START_POS):
-    """Forward KL(teacher || student) from start_pos onward, with padding mask.
+def batched_kl_loss(student_logits, teacher_logits, attention_mask,
+                    start_pos=KL_START_POS, kl_mode="top128", kl_topk=128):
+    """Forward KL(teacher || student), masked and averaged.
+
+    kl_mode:
+      "fullvocab"  — legacy full-vocab forward KL over all logits (pre-Day-11 loss).
+      "top128"     — prod-validator-matching loss. Exactly the math of
+                     compute_kl_from_sparse() in unarbos/distil/scripts/pod_eval_vllm.py:
+
+                       t_log_p_k   = log_softmax_k( teacher_logits.topk(K).values )
+                       s_log_p_k   = log_softmax_V( student_logits ).gather(at_teacher_top_k_idx)
+                       s_log_p_k_n = log_softmax_k( s_log_p_k )
+                       KL[b,l]     = sum_k exp(t_log_p_k) * ( t_log_p_k - s_log_p_k_n )
+
+                     i.e. both teacher and student are renormalized to a proper
+                     probability simplex over the teacher's top-K support before
+                     the KL is taken. K=128 matches pod_eval_vllm.py --logprobs-k 128.
 
     Args:
-        student_logits: [B, L, V] student model logits
-        teacher_logits: [B, L, V] teacher model logits (already on student device)
-        attention_mask: [B, L] binary mask (1 = real token, 0 = padding)
-        start_pos: skip first N positions
+        student_logits: [B, L, V]   student raw logits
+        teacher_logits: [B, L, V]   teacher raw logits (already on student device)
+        attention_mask: [B, L]      1 = real token, 0 = padding
+        start_pos:                  drop the first N positions (>=0)
+        kl_mode:                    "fullvocab" | "top128"
+        kl_topk:                    K for "top128" (default 128)
     """
     s = student_logits[:, start_pos:, :].float()
     t = teacher_logits[:, start_pos:, :].detach().float()
-    mask = attention_mask[:, start_pos:].float()  # [B, L-start_pos]
+    mask = attention_mask[:, start_pos:].float()   # [B, L-start_pos]
 
-    t_log_p = F.log_softmax(t, dim=-1)
-    s_log_p = F.log_softmax(s, dim=-1)
-    t_p = t_log_p.exp()
+    if kl_mode == "fullvocab":
+        t_log_p = F.log_softmax(t, dim=-1)
+        s_log_p = F.log_softmax(s, dim=-1)
+        kl_per_pos = (t_log_p.exp() * (t_log_p - s_log_p)).sum(dim=-1)    # [B, L-start_pos]
+    elif kl_mode == "top128":
+        # Teacher: top-K logits → renormalize as a distribution over K.
+        t_topk_vals, t_topk_idx = t.topk(kl_topk, dim=-1)                 # [B, L, K]
+        t_log_p_k = F.log_softmax(t_topk_vals, dim=-1)                    # [B, L, K]
+        # Student: full-vocab log-softmax → gather at teacher's K indices → renorm.
+        s_log_p_full = F.log_softmax(s, dim=-1)
+        s_log_p_k = s_log_p_full.gather(-1, t_topk_idx)                   # [B, L, K]
+        del s_log_p_full
+        s_log_p_k_norm = s_log_p_k - s_log_p_k.logsumexp(dim=-1, keepdim=True)
+        kl_per_pos = (t_log_p_k.exp() * (t_log_p_k - s_log_p_k_norm)).sum(dim=-1)
+    else:
+        raise ValueError(f"unknown kl_mode: {kl_mode!r} (use 'top128' or 'fullvocab')")
 
-    # KL per position: sum over vocab dim
-    kl_per_pos = (t_p * (t_log_p - s_log_p)).sum(dim=-1)  # [B, L-start_pos]
-
-    # Mask out padding positions
     kl_per_pos = kl_per_pos * mask
-
-    # Mean over non-padding positions
     n_valid = mask.sum()
     if n_valid == 0:
         return torch.tensor(0.0, device=s.device, requires_grad=True)
@@ -456,6 +549,16 @@ def main():
                         help="Max sequence length for tokenization")
     parser.add_argument("--kl_start_pos", type=int, default=KL_START_POS,
                         help="Compute KL from this token position onward (skip early context)")
+    parser.add_argument("--kl_mode", choices=["top128", "fullvocab"], default="top128",
+                        help="Loss form. 'top128' matches the prod validator "
+                             "(unarbos/distil compute_kl_from_sparse) exactly: renorm KL over the "
+                             "teacher's top-K support. 'fullvocab' is the legacy pre-Day-11 loss.")
+    parser.add_argument("--kl_topk", type=int, default=128,
+                        help="K for --kl_mode top128 (default 128, matches prod --logprobs-k 128).")
+    parser.add_argument("--no_fused_adam", action="store_true",
+                        help="Disable fused AdamW kernel (default: on when CUDA is available). "
+                             "Fused keeps optimizer moments in fp32 so updates don't silently "
+                             "round to zero under bf16 params at small LR.")
     parser.add_argument("--max_steps", type=int, default=0,
                         help="Stop after N steps (0 = run forever)")
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE,
@@ -477,6 +580,26 @@ def main():
                         help="Random seed for prompt sampling")
     parser.add_argument("--resample_every", type=int, default=1,
                         help="Resample fresh prompts every N steps (1 = every step)")
+    parser.add_argument("--prompts_file", type=str, default=None,
+                        help="Optional local JSONL file with prompts (each line: {'text': ...}). "
+                             "If set, overrides the HF ClimbMix sampler. Used for per-category training.")
+
+    # LoRA / PEFT options (via HF peft library)
+    parser.add_argument("--lora", action="store_true",
+                        help="Wrap student with LoRA adapters (uses HF peft).")
+    parser.add_argument("--lora_rank", type=int, default=8,
+                        help="LoRA rank r (default 8, matching Day 7 Exp 7.4).")
+    parser.add_argument("--lora_alpha", type=int, default=16,
+                        help="LoRA alpha (scaling). Default 16 (= 2x rank).")
+    parser.add_argument("--lora_dropout", type=float, default=0.0)
+    parser.add_argument("--lora_target", type=str,
+                        default="q_proj,k_proj,v_proj,o_proj",
+                        help="Comma-separated list of linear module names to adapt "
+                             "(default: attn-only, matching Day 7 Exp 7.4 safe recipe).")
+    parser.add_argument("--use_dora", action="store_true",
+                        help="Use DoRA (weight-decomposition LoRA) instead of vanilla LoRA.")
+    parser.add_argument("--use_rslora", action="store_true",
+                        help="Use rank-stabilized LoRA scaling (alpha / sqrt(r)).")
 
     # Output
     parser.add_argument("--output_dir", type=str, default="./distil-checkpoints",
@@ -562,9 +685,9 @@ def main():
     # -- Load teacher ----------------------------------------------------------
     # Skip teacher loading entirely when using a pre-built cache file
     skip_teacher = (
-        args.continuation
-        and args.cache_continuations
-        and os.path.isfile(args.cache_continuations)
+        getattr(args, "continuation", False)
+        and getattr(args, "cache_continuations", None)
+        and os.path.isfile(getattr(args, "cache_continuations", ""))
     )
     vllm_teacher = None
 
@@ -635,6 +758,29 @@ def main():
         ).to(f"cuda:{args.student_gpu}")
         sdev = torch.device(f"cuda:{args.student_gpu}")
 
+    # Optional LoRA/DoRA wrap (HF peft). Must happen BEFORE optimizer init so
+    # only adapter params get AdamW state.
+    if args.lora:
+        from peft import LoraConfig, get_peft_model
+        targets = [t.strip() for t in args.lora_target.split(",") if t.strip()]
+        lora_cfg = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=targets,
+            bias="none",
+            task_type="CAUSAL_LM",
+            use_dora=args.use_dora,
+            use_rslora=args.use_rslora,
+        )
+        student = get_peft_model(student, lora_cfg)
+        # Required so gradients flow through frozen embeddings when
+        # gradient_checkpointing is enabled.
+        if hasattr(student, "enable_input_require_grads"):
+            student.enable_input_require_grads()
+        log.info(f"  LoRA enabled: rank={args.lora_rank} alpha={args.lora_alpha} "
+                 f"targets={targets} dora={args.use_dora} rslora={args.use_rslora}")
+
     student.train()
     student.gradient_checkpointing_enable()
     log.info("  Gradient checkpointing enabled (trades compute for ~50%% less activation memory)")
@@ -647,10 +793,24 @@ def main():
     log.info(f"  Batch size: {args.batch_size}, Top-k distil: {args.topk_distil or 'off (full vocab)'}")
 
     # -- Optimizer & scheduler -------------------------------------------------
-    optimizer = AdamW(
-        [p for p in student.parameters() if p.requires_grad],
-        lr=args.lr, weight_decay=args.weight_decay,
-    )
+    # fused=True on CUDA keeps exp_avg / exp_avg_sq in fp32 regardless of param
+    # dtype, avoiding the bf16-quantization-to-zero update issue at small LR
+    # (Day 9 Exp 11 saw this at LR=1e-6 with bf16 params). A fallback is kept
+    # for the rare case where fused kernels aren't available.
+    use_fused = torch.cuda.is_available() and not args.no_fused_adam
+    try:
+        optimizer = AdamW(
+            [p for p in student.parameters() if p.requires_grad],
+            lr=args.lr, weight_decay=args.weight_decay,
+            fused=use_fused,
+        )
+        log.info(f"  Optimizer: AdamW(fused={use_fused})")
+    except (TypeError, RuntimeError) as e:
+        log.warning(f"  fused AdamW unavailable ({e}); falling back to non-fused")
+        optimizer = AdamW(
+            [p for p in student.parameters() if p.requires_grad],
+            lr=args.lr, weight_decay=args.weight_decay,
+        )
     from transformers import get_cosine_schedule_with_warmup
     scheduler = get_cosine_schedule_with_warmup(optimizer, args.warmup_steps, 100_000)
 
@@ -677,7 +837,10 @@ def main():
             log.info("  Loaded %d prior rows from %s", len(train_history), metrics_csv_path)
 
     # -- Prompt sampler --------------------------------------------------------
-    sampler = RandomPromptSampler(seed=args.seed)
+    if getattr(args, "prompts_file", None):
+        sampler = JSONLPromptSampler(args.prompts_file, seed=args.seed)
+    else:
+        sampler = RandomPromptSampler(seed=args.seed)
     cached_texts = None
     best_train_kl = float("inf")
 
@@ -784,6 +947,8 @@ def main():
                 s_logits, t_logits,
                 mb_mask.to(sdev),
                 start_pos=args.kl_start_pos,
+                kl_mode=args.kl_mode,
+                kl_topk=args.kl_topk,
             )
 
             # Scale loss by number of micro-batches for gradient accumulation

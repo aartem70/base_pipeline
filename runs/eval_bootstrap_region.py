@@ -88,13 +88,30 @@ def main():
     cache = torch.load(args.cache, map_location="cpu", weights_only=False, mmap=True)
     full_sequences = cache["full_sequences"]
     prompt_lens = cache["prompt_lens"]
-    # Prefer full-seq logits if available
+    # Prefer full-seq logits; fall back to sparse top-K format
+    sparse_mode = False
     if "teacher_logits_full" in cache:
         teacher_logits_full = cache["teacher_logits_full"]
+        teacher_topk_vals = None
+        teacher_topk_idx = None
         print(f"  using full-sequence teacher logits", flush=True)
+    elif "teacher_topk_vals" in cache and "teacher_topk_idx" in cache:
+        teacher_logits_full = None
+        teacher_topk_vals = cache["teacher_topk_vals"]
+        teacher_topk_idx = cache["teacher_topk_idx"]
+        sparse_mode = True
+        K_cache = cache.get("topk", teacher_topk_vals[0].shape[-1])
+        print(f"  using SPARSE top-{K_cache} teacher cache "
+              f"(region must be cont_top128 with K <= {K_cache})", flush=True)
+        if args.region != "cont_top128":
+            raise RuntimeError("Sparse cache only supports region=cont_top128")
+        if args.topk > K_cache:
+            raise RuntimeError(f"--topk {args.topk} > cache top-{K_cache}")
     else:
-        raise RuntimeError("Cache does not contain teacher_logits_full; "
-                           "rebuild with build_fullseq_teacher_cache.py")
+        raise RuntimeError("Cache does not contain teacher_logits_full or "
+                           "teacher_topk_vals; rebuild with "
+                           "build_fullseq_teacher_cache.py or "
+                           "extract_topk_sparse.py")
     print(f"  {len(full_sequences)} prompts", flush=True)
 
     # Apply same min-completion filter as eval_bootstrap.py
@@ -107,7 +124,11 @@ def main():
           flush=True)
     full_sequences = [full_sequences[i] for i in kept]
     prompt_lens = [prompt_lens[i] for i in kept]
-    teacher_logits_full = [teacher_logits_full[i] for i in kept]
+    if sparse_mode:
+        teacher_topk_vals = [teacher_topk_vals[i] for i in kept]
+        teacher_topk_idx = [teacher_topk_idx[i] for i in kept]
+    else:
+        teacher_logits_full = [teacher_logits_full[i] for i in kept]
 
     # Tokenizer for answer-span mode
     tokenizer = None
@@ -137,7 +158,12 @@ def main():
         batch_end = min(batch_start + args.batch_size, n)
         batch_seqs = full_sequences_gpu[batch_start:batch_end]
         batch_plens = prompt_lens[batch_start:batch_end]
-        batch_t = teacher_logits_full[batch_start:batch_end]
+        if sparse_mode:
+            batch_tv = teacher_topk_vals[batch_start:batch_end]
+            batch_ti = teacher_topk_idx[batch_start:batch_end]
+            batch_t = None
+        else:
+            batch_t = teacher_logits_full[batch_start:batch_end]
 
         max_len = max(s.shape[1] for s in batch_seqs)
         padded = torch.zeros(len(batch_seqs), max_len,
@@ -156,7 +182,12 @@ def main():
         for j in range(len(batch_seqs)):
             plen = batch_plens[j]
             L = batch_seqs[j].shape[1]
-            t_full = batch_t[j].to(args.device).float()  # [L, V]
+            if sparse_mode:
+                t_full = None
+                tv = batch_tv[j].to(args.device).float()  # [L, K_cache]
+                ti = batch_ti[j].to(args.device)          # [L, K_cache]
+            else:
+                t_full = batch_t[j].to(args.device).float()  # [L, V]
 
             # Decide which positions to score. We always score "predict token k
             # given context up to k-1", using logits[k-1]. So the score
@@ -165,10 +196,10 @@ def main():
                 start = plen - 1
                 end = L - 1
             elif args.region == "cont_top128":
-                # Validator-style sparse top-K KL over continuation positions.
-                # Teacher: softmax over its own top-K logits.
-                # Student: full-vocab log_softmax, gather at teacher top-K indices,
-                # then renormalize over the same K support.
+                # Sparse top-K renormalized KL over continuation positions.
+                # Teacher: softmax over its own top-K logits (or cached top-K).
+                # Student: full-vocab log_softmax, gather at teacher top-K
+                # indices, then renormalize over the same K support.
                 start = plen - 1
                 end = L - 1
                 if end <= start:
@@ -179,9 +210,13 @@ def main():
                 CHUNK = 256
                 for c0 in range(start, end, CHUNK):
                     c1 = min(c0 + CHUNK, end)
-                    t_slice = t_full[c0:c1, :]
                     s_slice = s_logits[j, c0:c1, :]
-                    t_topk_vals, t_topk_idx = t_slice.topk(K, dim=-1)
+                    if sparse_mode:
+                        t_topk_vals = tv[c0:c1, :K]
+                        t_topk_idx = ti[c0:c1, :K]
+                    else:
+                        t_slice = t_full[c0:c1, :]
+                        t_topk_vals, t_topk_idx = t_slice.topk(K, dim=-1)
                     t_lp_k = F.log_softmax(t_topk_vals, dim=-1)
                     s_lp_full = F.log_softmax(s_slice, dim=-1)
                     s_lp_k = s_lp_full.gather(-1, t_topk_idx)
@@ -189,7 +224,7 @@ def main():
                     chunk_kl = F.kl_div(s_lp_k, t_lp_k, log_target=True,
                                          reduction="none").sum(-1).sum().item()
                     total_kl += chunk_kl
-                    del t_slice, s_slice, t_topk_vals, t_topk_idx, t_lp_k, s_lp_full, s_lp_k
+                    del s_slice, t_topk_vals, t_topk_idx, t_lp_k, s_lp_full, s_lp_k
                 per_prompt_kl.append(total_kl / n_pos)
                 per_prompt_n_positions.append(n_pos)
                 continue

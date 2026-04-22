@@ -43,8 +43,24 @@ htmlcov/
 # Jupyter
 .ipynb_checkpoints/
 
-# Training checkpoints
+# Training checkpoints and experiment output dirs (often contain GB-scale
+# model weights — we track the launcher scripts but not their outputs).
+# Primary checkpoint location is /root/checkpoints/ (outside the repo).
+# These patterns still catch any stray checkpoint dir if something is
+# misconfigured to write under the repo.
 distil-checkpoints/
+checkpoints/
+runs/exp_*/
+runs/smoke_*/
+runs/exp_percat_*/
+runs/exp_longlora_*/
+
+# Heavy local data: raw dataset shards, byte-offset indices, label parquet,
+# teacher caches. Regeneratable from scripts; too large to version.
+caches/
+
+# Stdout/stderr logs from training and labeling runs.
+logs/
 
 # Weights & Biases (local run data)
 wandb/
@@ -60,4 +76,3 @@ cuda-keyring_*.deb
 .idea/
 .vscode/
 .claude/
-experiments.log

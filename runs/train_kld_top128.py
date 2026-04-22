@@ -86,7 +86,9 @@ def main():
     ap.add_argument("--kl_continuation_only", action="store_true", default=True,
                     help="mask KL to continuation positions (skip prompt)")
     ap.add_argument("--topk", type=int, default=128,
-                    help="Top-K support for renormalized KL (validator uses 128).")
+                    help="Top-K support for renormalized KL.")
+    ap.add_argument("--full_params", action="store_true",
+                    help="Train ALL parameters, not just norm/bias.")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -97,11 +99,26 @@ def main():
 
     print(f"[load cache mmap] {args.cache}", flush=True)
     cache = torch.load(args.cache, map_location="cpu", weights_only=False, mmap=True)
-    seqs = cache["sequences"]
     plens = cache["prompt_lens"]
-    t_logits_list = cache["teacher_logits"]  # list of bf16 tensors, mmap'd
+    sparse_cache = "teacher_topk_vals" in cache
+    if sparse_cache:
+        # Sparse top-K cache from extract_topk_sparse.py
+        seqs = [s.squeeze(0) if s.dim() == 2 else s for s in cache["full_sequences"]]
+        t_topk_vals_list = cache["teacher_topk_vals"]
+        t_topk_idx_list = cache["teacher_topk_idx"]
+        K_cache = cache.get("topk", t_topk_vals_list[0].shape[-1])
+        t_logits_list = None
+        print(f"  SPARSE cache: top-{K_cache} teacher", flush=True)
+        if args.topk > K_cache:
+            raise RuntimeError(f"--topk {args.topk} > cached top-{K_cache}")
+    else:
+        seqs = cache["sequences"]
+        t_logits_list = cache["teacher_logits"]
+        t_topk_vals_list = None
+        t_topk_idx_list = None
+        print(f"  FULL-vocab cache", flush=True)
     n = len(seqs)
-    print(f"  n={n} (mmap: teacher_logits paged in per batch)", flush=True)
+    print(f"  n={n}", flush=True)
 
     print(f"[load student] {args.student}", flush=True)
     t0 = time.time()
@@ -117,14 +134,21 @@ def main():
 
     n_total = sum(p.numel() for p in student.parameters())
     n_trainable = 0
-    for name, p in student.named_parameters():
-        if is_norm_or_bias(name, p):
+    if args.full_params:
+        for p in student.parameters():
             p.requires_grad_(True)
             n_trainable += p.numel()
-        else:
-            p.requires_grad_(False)
-    print(f"  total params = {n_total/1e9:.3f}B; trainable = {n_trainable/1e6:.2f}M "
-          f"({n_trainable/n_total*100:.2f}%)", flush=True)
+        print(f"  total params = {n_total/1e9:.3f}B; trainable = ALL "
+              f"({n_total/1e9:.3f}B, 100%)", flush=True)
+    else:
+        for name, p in student.named_parameters():
+            if is_norm_or_bias(name, p):
+                p.requires_grad_(True)
+                n_trainable += p.numel()
+            else:
+                p.requires_grad_(False)
+        print(f"  total params = {n_total/1e9:.3f}B; trainable = {n_trainable/1e6:.2f}M "
+              f"({n_trainable/n_total*100:.2f}%)", flush=True)
 
     student.train()
     try:
@@ -175,9 +199,17 @@ def main():
 
         batch_seqs = [seqs[i][:args.max_seq_len] for i in batch_idx]
         batch_plens = [min(plens[i], args.max_seq_len - 1) for i in batch_idx]
-        # teacher logits shape per sample: [L, V]
-        batch_tlogits = [t_logits_list[i][:args.max_seq_len].clone()  # force copy from mmap
-                         for i in batch_idx]
+        if sparse_cache:
+            batch_tvals = [t_topk_vals_list[i][:args.max_seq_len].clone()
+                           for i in batch_idx]
+            batch_tidx = [t_topk_idx_list[i][:args.max_seq_len].clone()
+                          for i in batch_idx]
+            batch_tlogits = None
+        else:
+            batch_tlogits = [t_logits_list[i][:args.max_seq_len].clone()
+                             for i in batch_idx]
+            batch_tvals = None
+            batch_tidx = None
 
         input_ids, attn = pad_batch(batch_seqs, pad_id=tokenizer.pad_token_id or 0)
         input_ids = input_ids.to(args.device)
@@ -194,25 +226,19 @@ def main():
         for b in range(B):
             seq_len = batch_seqs[b].shape[0]
             plen = batch_plens[b]
-            t = batch_tlogits[b].to(args.device).float()  # [seq_len, V]
             s = s_logits[b, :seq_len, :].float()
-            # predict token t from position t-1: teacher_logits[t-1] is the dist to predict
-            #   teacher_logits are stored unshifted: t[t] = dist at position t
-            # For match:
-            #   student_logits[b, t, :] = student's dist at position t (predicting t+1)
-            # Both should match at positions [plen-1 ... seq_len-2] (inclusive)
-            # so the pair is (s_logits[plen-1:seq_len-1], t_logits[plen-1:seq_len-1])
             start = plen - 1 if args.kl_continuation_only else 0
             end = seq_len - 1
             if end <= start:
                 continue
-            t_slice = t[start:end]  # [k, V]
             s_slice = s[start:end]  # [k, V]
-            # Validator-style sparse top-K KL:
-            # Teacher = softmax over its own top-K logits.
-            # Student = full-vocab log_softmax, gather at teacher top-K indices,
-            # then renormalize over the same K support.
-            t_topk_vals, t_topk_idx = t_slice.topk(args.topk, dim=-1)
+            if sparse_cache:
+                t_topk_vals = batch_tvals[b][start:end, :args.topk].to(args.device).float()
+                t_topk_idx = batch_tidx[b][start:end, :args.topk].to(args.device)
+            else:
+                t = batch_tlogits[b].to(args.device).float()
+                t_slice = t[start:end]
+                t_topk_vals, t_topk_idx = t_slice.topk(args.topk, dim=-1)
             t_lp_k = F.log_softmax(t_topk_vals, dim=-1)
             s_lp_full = F.log_softmax(s_slice, dim=-1)
             s_lp_k = s_lp_full.gather(-1, t_topk_idx)
