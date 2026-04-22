@@ -1,0 +1,16 @@
+-r requirements.txt
+
+# CUDA acceleration packages - require nvcc + matching CUDA toolkit.
+# Do NOT install via pip install -r. Follow SETUP.md Step 2 instead.
+#
+# Quick install (after SETUP.md Step 2a-2d):
+#   pip install causal-conv1d --no-build-isolation
+#   pip install flash-attn --no-build-isolation
+#
+# These will NOT work with pip install -r because they need:
+#   1. CUDA toolkit matching PyTorch's CUDA version
+#   2. C++ compiler (g++-11) visible to nvcc
+#   3. --no-build-isolation flag
+
+# Pure Python wrapper (no build needed)
+flash-linear-attention>=0.1.0
