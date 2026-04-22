@@ -50,20 +50,87 @@ SKIP_FILES = {
 }
 
 
+def upload_single_file(args, hf_token):
+    """Upload one local file (e.g. a .pt cache) to a HF repo (default: dataset)."""
+    from huggingface_hub import HfApi, create_repo
+
+    if not os.path.isfile(args.file):
+        log.error(f"File not found: {args.file}")
+        sys.exit(1)
+
+    repo_type = args.repo_type or "dataset"
+    path_in_repo = args.path_in_repo or os.path.basename(args.file)
+    size_mb = os.path.getsize(args.file) / 1e6
+
+    api = HfApi(token=hf_token)
+    try:
+        user_info = api.whoami()
+        log.info(f"Authenticated as: {user_info['name']}")
+    except Exception:
+        log.error("Invalid HF_TOKEN. Check your token in .env file.")
+        sys.exit(1)
+
+    log.info(f"Creating {repo_type} repo: {args.repo} (private={args.private})...")
+    repo_url = create_repo(
+        repo_id=args.repo, repo_type=repo_type,
+        private=args.private, exist_ok=True, token=hf_token,
+    )
+    log.info(f"  Repo ready: {repo_url}")
+
+    log.info(f"Uploading {args.file} ({size_mb:.1f} MB) -> {path_in_repo}")
+    api.upload_file(
+        path_or_fileobj=args.file,
+        path_in_repo=path_in_repo,
+        repo_id=args.repo,
+        repo_type=repo_type,
+        commit_message=args.commit_message,
+    )
+    try:
+        rev = api.repo_info(repo_id=args.repo, repo_type=repo_type).sha
+    except Exception:
+        rev = "(could not fetch)"
+    log.info("=" * 60)
+    log.info(f"  Upload complete: https://huggingface.co/{repo_type}s/{args.repo}"
+             if repo_type == "dataset"
+             else f"  Upload complete: https://huggingface.co/{args.repo}")
+    log.info(f"  Revision: {rev}")
+    log.info("=" * 60)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Upload a trained model to HuggingFace Hub",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--model_dir", type=str, required=True,
-                        help="Local directory containing the model files")
+    parser.add_argument("--model_dir", type=str, default=None,
+                        help="Local directory containing model files (model-upload mode)")
+    parser.add_argument("--file", type=str, default=None,
+                        help="Single file to upload, e.g. a .pt cache (defaults to dataset repo type)")
+    parser.add_argument("--repo_type", type=str, default=None, choices=["model", "dataset"],
+                        help="Override repo type. Default: model for --model_dir, dataset for --file")
+    parser.add_argument("--path_in_repo", type=str, default=None,
+                        help="Override destination path inside repo (single-file mode only); "
+                             "defaults to the local file's basename")
     parser.add_argument("--repo", type=str, required=True,
                         help="HuggingFace repo ID (e.g. 'your-username/my-distilled-model')")
     parser.add_argument("--private", action="store_true",
                         help="Create as a private repo (must be made public before submission)")
-    parser.add_argument("--commit_message", type=str, default="Upload distilled model",
+    parser.add_argument("--commit_message", type=str, default="Upload",
                         help="Commit message for the upload")
     args = parser.parse_args()
+
+    if (args.model_dir is None) == (args.file is None):
+        log.error("Exactly one of --model_dir or --file must be provided.")
+        sys.exit(1)
+
+    hf_token = os.environ.get("HF_TOKEN")
+    if not hf_token:
+        log.error("HF_TOKEN not found. Add it to .env file: HF_TOKEN=hf_your_token_here")
+        sys.exit(1)
+
+    if args.file is not None:
+        upload_single_file(args, hf_token)
+        return
 
     if not os.path.isdir(args.model_dir):
         log.error(f"Model directory not found: {args.model_dir}")
@@ -83,11 +150,6 @@ def main():
         sys.exit(1)
 
     from huggingface_hub import HfApi, create_repo
-
-    hf_token = os.environ.get("HF_TOKEN")
-    if not hf_token:
-        log.error("HF_TOKEN not found. Add it to .env file: HF_TOKEN=hf_your_token_here")
-        sys.exit(1)
 
     api = HfApi(token=hf_token)
 
